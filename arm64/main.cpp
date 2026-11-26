@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,9 +30,28 @@ constexpr size_t kHtSize = 1u << 19;
 uint32_t u32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1])<<8 | uint32_t(p[2])<<16 | uint32_t(p[3])<<24; }
 uint64_t u64(const uint8_t* p) { return uint64_t(u32(p)) | uint64_t(u32(p+4))<<32; }
 size_t align64(size_t x) { return (x + 63) & ~size_t(63); }
-float fp16(const uint8_t* p) { uint16_t h=p[0]|uint16_t(p[1])<<8; return static_cast<float>(std::bit_cast<_Float16>(h)); }
+float fp16(const uint8_t* p) {
+    const uint16_t h=uint16_t(p[0])|uint16_t(p[1])<<8;
+    const uint32_t sign=uint32_t(h&0x8000u)<<16;
+    uint32_t exponent=(h>>10)&0x1fu;
+    uint32_t mantissa=h&0x03ffu;
+    uint32_t bits;
+    if(exponent==0){
+        if(mantissa==0) bits=sign;
+        else {
+            int e=-14;
+            while((mantissa&0x0400u)==0){mantissa<<=1;--e;}
+            mantissa&=0x03ffu;
+            bits=sign|(uint32_t(e+127)<<23)|(mantissa<<13);
+        }
+    } else if(exponent==0x1fu) {
+        bits=sign|0x7f800000u|(mantissa<<13);
+    } else {
+        bits=sign|((exponent+112u)<<23)|(mantissa<<13);
+    }
+    return std::bit_cast<float>(bits);
+}
 
-struct Merge { uint64_t key; uint32_t token, rank; };
 struct Matrix { const uint8_t* data{}; uint32_t rows{}, cols{}; size_t row_stride{}; };
 
 struct Model {
@@ -118,11 +138,12 @@ void matvec(const Model& m,const Matrix& w,const float* x,float* y) {
 void dequant(const Model& m,const uint8_t* row,float* out,uint32_t n){for(uint32_t b=0;b<n/32;++b){float s=m.scale_bytes==2?fp16(row+n+2*b):std::bit_cast<float>(u32(row+n+4*b));for(int j=0;j<32;++j)out[b*32+j]=int8_t(row[b*32+j])*s;}}
 void rmsnorm(float* out,const float* x,const float* w,uint32_t n,float eps){double ss=0;for(uint32_t i=0;i<n;++i)ss+=double(x[i])*x[i];float k=1.f/std::sqrt(float(ss/n)+eps);for(uint32_t i=0;i<n;++i)out[i]=x[i]*k*w[i];}
 void add(float* x,const float* y,uint32_t n){for(uint32_t i=0;i<n;++i)x[i]+=y[i];}
+float silu(float x){if(x>=0.f)return x/(1.f+std::exp(-x));float e=std::exp(x);return x*e/(1.f+e);}
 
 struct Engine {
     const Model& m; uint32_t qdim, kvdim, maxseq; std::vector<float> x,xb,q,k,v,att,gate,up,logits,cosv,sinv;
-    std::vector<float> kc,vc; std::vector<double> invfreq;
-    explicit Engine(const Model& model,uint32_t ctx):m(model),qdim(m.n_heads*m.head_dim),kvdim(m.n_kv*m.head_dim),maxseq(std::min(ctx,m.max_seq)),x(m.dim),xb(m.dim),q(qdim),k(kvdim),v(kvdim),att(qdim),gate(m.hidden),up(m.hidden),logits(m.vocab),cosv(m.head_dim/2),sinv(m.head_dim/2),kc(size_t(m.n_layers)*m.n_kv*maxseq*m.head_dim),vc(kc.size()),invfreq(m.head_dim/2){for(uint32_t i=0;i<m.head_dim/2;++i)invfreq[i]=std::pow(double(m.rope_theta),-2.0*i/m.head_dim);}
+    std::vector<float> kc,vc,scores; std::vector<double> invfreq;
+    explicit Engine(const Model& model,uint32_t ctx):m(model),qdim(m.n_heads*m.head_dim),kvdim(m.n_kv*m.head_dim),maxseq(std::min(ctx,m.max_seq)),x(m.dim),xb(m.dim),q(qdim),k(kvdim),v(kvdim),att(qdim),gate(m.hidden),up(m.hidden),logits(m.vocab),cosv(m.head_dim/2),sinv(m.head_dim/2),kc(size_t(m.n_layers)*m.n_kv*maxseq*m.head_dim),vc(kc.size()),scores(maxseq),invfreq(m.head_dim/2){for(uint32_t i=0;i<m.head_dim/2;++i)invfreq[i]=std::pow(double(m.rope_theta),-2.0*i/m.head_dim);}
     float* cache(std::vector<float>& c,uint32_t l,uint32_t h,uint32_t pos){return c.data()+(((size_t(l)*m.n_kv+h)*maxseq+pos)*m.head_dim);}
     void forward(uint32_t tok,uint32_t pos,bool calc){
         if(pos>=maxseq)throw std::runtime_error("context full; clear the conversation");
@@ -136,9 +157,33 @@ struct Engine {
             auto rope=[&](float* a,uint32_t heads){for(uint32_t h=0;h<heads;++h){float* z=a+size_t(h)*m.head_dim;for(uint32_t i=0;i<m.head_dim/2;++i){float x0=z[i],x1=z[i+m.head_dim/2];z[i]=x0*cosv[i]-x1*sinv[i];z[i+m.head_dim/2]=x1*cosv[i]+x0*sinv[i];}}};rope(q.data(),m.n_heads);rope(k.data(),m.n_kv);
             for(uint32_t h=0;h<m.n_kv;++h){std::copy_n(k.data()+size_t(h)*m.head_dim,m.head_dim,cache(kc,l,h,pos));std::copy_n(v.data()+size_t(h)*m.head_dim,m.head_dim,cache(vc,l,h,pos));}
             uint32_t ratio=m.n_heads/m.n_kv;
-            for(uint32_t h=0;h<m.n_heads;++h){uint32_t kh=h/ratio;float* out=att.data()+size_t(h)*m.head_dim;std::vector<float> scores(pos+1);float mx=-std::numeric_limits<float>::infinity();for(uint32_t t=0;t<=pos;++t){const float* kk=cache(kc,l,kh,t);float dot=0;for(uint32_t d=0;d<m.head_dim;++d)dot+=q[size_t(h)*m.head_dim+d]*kk[d];scores[t]=dot*scale;mx=std::max(mx,scores[t]);}float den=0;for(float& z:scores){z=std::exp(z-mx);den+=z;}std::fill_n(out,m.head_dim,0.f);for(uint32_t t=0;t<=pos;++t){float p=scores[t]/den;const float* vv=cache(vc,l,kh,t);for(uint32_t d=0;d<m.head_dim;++d)out[d]+=p*vv[d];}}
+            for(uint32_t h=0;h<m.n_heads;++h){
+                uint32_t kh=h/ratio;float* out=att.data()+size_t(h)*m.head_dim;
+                float mx=-std::numeric_limits<float>::infinity();uint32_t positive_infinities=0;
+                for(uint32_t t=0;t<=pos;++t){
+                    const float* kk=cache(kc,l,kh,t);float dot=0;
+                    for(uint32_t d=0;d<m.head_dim;++d)dot+=q[size_t(h)*m.head_dim+d]*kk[d];
+                    scores[t]=dot*scale;
+                    if(scores[t]==std::numeric_limits<float>::infinity())++positive_infinities;
+                    else if(std::isfinite(scores[t]))mx=std::max(mx,scores[t]);
+                }
+                float den=0;
+                if(positive_infinities){
+                    for(uint32_t t=0;t<=pos;++t){scores[t]=scores[t]==std::numeric_limits<float>::infinity()?1.f:0.f;den+=scores[t];}
+                } else if(std::isfinite(mx)) {
+                    for(uint32_t t=0;t<=pos;++t){scores[t]=std::isfinite(scores[t])?std::exp(scores[t]-mx):0.f;den+=scores[t];}
+                }
+                if(!(den>0.f)||!std::isfinite(den)){
+                    const float uniform=1.f/float(pos+1);
+                    std::fill_n(scores.begin(),pos+1,uniform);
+                } else {
+                    for(uint32_t t=0;t<=pos;++t)scores[t]/=den;
+                }
+                std::fill_n(out,m.head_dim,0.f);
+                for(uint32_t t=0;t<=pos;++t){float p=scores[t];const float* vv=cache(vc,l,kh,t);for(uint32_t d=0;d<m.head_dim;++d)out[d]+=p*vv[d];}
+            }
             matvec(m,w[3],att.data(),xb.data());add(x.data(),xb.data(),m.dim);
-            rmsnorm(xb.data(),x.data(),n[3],m.dim,m.eps);matvec(m,w[4],xb.data(),gate.data());matvec(m,w[5],xb.data(),up.data());for(uint32_t i=0;i<m.hidden;++i){float g=gate[i];gate[i]=(g/(1.f+std::exp(-g)))*up[i];}matvec(m,w[6],gate.data(),xb.data());add(x.data(),xb.data(),m.dim);
+            rmsnorm(xb.data(),x.data(),n[3],m.dim,m.eps);matvec(m,w[4],xb.data(),gate.data());matvec(m,w[5],xb.data(),up.data());for(uint32_t i=0;i<m.hidden;++i)gate[i]=silu(gate[i])*up[i];matvec(m,w[6],gate.data(),xb.data());add(x.data(),xb.data(),m.dim);
         }
         if(calc){rmsnorm(x.data(),x.data(),reinterpret_cast<const float*>(m.final_norm),m.dim,m.eps);Matrix e{m.embed,m.vocab,m.dim,m.rs(m.dim)};matvec(m,e,x.data(),logits.data());}
     }
@@ -149,12 +194,23 @@ void run_turn(const Model& m,Engine& e,const std::string& text,uint32_t& pos,uin
     auto toks=m.encode(text);std::vector<uint32_t> prompt{kImStart,kUser,kNl};prompt.insert(prompt.end(),toks.begin(),toks.end());prompt.insert(prompt.end(),{kImEnd,kNl,kImStart,kAssistant,kNl,kThinkStart,kNl2,kThinkEnd,kNl2});
     if(uint64_t(pos)+prompt.size()+maxgen+2>=e.maxseq){std::cerr<<"[chat] context full, resetting KV-cache\n";pos=0;}
     std::cerr<<"[chat] ctx="<<pos<<"/"<<e.maxseq<<"\n";
+    const auto prefill_start=std::chrono::steady_clock::now();
     for(size_t i=0;i<prompt.size();++i)e.forward(prompt[i],pos++,i+1==prompt.size());
+    const auto prefill_end=std::chrono::steady_clock::now();
+    const auto decode_start=prefill_end;
     uint32_t token=e.next(),made=0;
-    while(made<maxgen&&token!=m.eos1&&token!=m.eos2&&pos<e.maxseq){std::string s=m.token(token);std::cout<<s<<std::flush;++made;e.forward(token,pos++,true);token=e.next();}
+    while(made<maxgen&&token!=m.eos1&&token!=m.eos2&&pos<e.maxseq){
+        std::string s=m.token(token);std::cout<<s<<std::flush;++made;
+        if(made==maxgen||pos+1>=e.maxseq){e.forward(token,pos++,false);break;}
+        e.forward(token,pos++,true);token=e.next();
+    }
+    const auto decode_end=std::chrono::steady_clock::now();
     std::cout<<"\n"<<std::flush;
     if(pos+2<e.maxseq){e.forward(m.eos1,pos++,false);e.forward(kNl,pos++,false);}
     std::cerr<<"[chat] ctx="<<pos<<"/"<<e.maxseq<<"\n";
+    const double prefill_s=std::chrono::duration<double>(prefill_end-prefill_start).count();
+    const double decode_s=std::chrono::duration<double>(decode_end-decode_start).count();
+    std::cerr<<"[speed] prompt="<<prompt.size()<<" tokens, "<<(prefill_s?prompt.size()/prefill_s:0)<<" tok/s; generated="<<made<<" tokens, "<<(decode_s?made/decode_s:0)<<" tok/s\n";
 }
 }
 
