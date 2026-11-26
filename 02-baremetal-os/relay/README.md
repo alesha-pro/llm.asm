@@ -2,9 +2,11 @@
 
 An OpenAI-compatible HTTP API for the [Phase 2 bare-metal OS](../README.md): the 24 KB x86-64 kernel that boots Qwen3-0.6B with no operating system underneath.
 
-That kernel has no network driver. Its only way in or out is the serial console. llm-relay sits on the other end of that serial line: QEMU connects the VM's COM1 to the relay over TCP, and the relay types prompts into the console, reads the answers back and serves them as `/v1/chat/completions`. Any OpenAI client, SDK or chat UI can then talk to a model that runs with no OS.
+That kernel has no network driver. Its only way in or out is the serial console. llm-relay sits on the other end of that serial line: QEMU connects the VM's COM1 to the relay over TCP, and the relay types prompts into the console, reads the answers back and serves them as `/v1/chat/completions`. OpenAI clients can use it for chat and function tool calls, including OpenCode.
 
 One Python file, standard library only (Python 3.8+).
+
+Check the relay version or command options with `python3 02-baremetal-os/relay/llm-relay.py --version` or `--help`.
 
 ```
 OpenAI client ── HTTP :8080 ──> llm-relay <── TCP :7000 ── QEMU (chardev client) ── COM1 of the llm.asm VM
@@ -41,6 +43,54 @@ From the repository root:
                                       messages=[{"role": "user", "content": "Hello"}])
    print(r.choices[0].message.content)
    ```
+
+### OpenCode
+
+The relay supports Qwen3 function tools by sending compact tool signatures to the console and
+turning Qwen's `<tool_call>{"name":"...","arguments":{...}}</tool_call>` output into OpenAI
+`tool_calls`. Tool results and earlier tool calls are folded into the next one-line prompt.
+The console accepts at most 1000 prompt bytes by default, so the oldest conversation turns and,
+when necessary, trailing tool signatures are dropped to fit. The model can only call tools whose
+signatures fit in that prompt. Qwen3-0.6B can emit tool calls, but small models may choose the wrong
+tool or produce invalid arguments; review tool use as you would any coding agent.
+
+If Strata is already using port 8080 on the same host, run the relay on another port:
+
+```bash
+LLM_HTTP_PORT=8081 LLM_BOOT_MAX_TOKENS=256 python3 02-baremetal-os/relay/llm-relay.py
+```
+
+For OpenCode v2.3.0, configure a custom OpenAI-compatible provider in `opencode.json` or
+`opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "baremetal/qwen3-0.6b",
+  "provider": {
+    "baremetal": {
+      "name": "Bare-metal Qwen",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8081/v1" },
+      "models": {
+        "qwen3-0.6b": {
+          "name": "Qwen3 0.6B (llm.asm)",
+          "id": "qwen3-0.6b-llm.asm",
+          "tool_call": true,
+          "limit": { "context": 32768, "output": 256 }
+        }
+      }
+    }
+  }
+}
+```
+
+OpenCode needs a larger context budget to fit its own system and tool descriptions before sending
+the request. The relay condenses that request to one console line (at most 1000 bytes by default);
+the bare-metal kernel still uses its 2048-token context. If `LLM_API_KEY` is set for the relay,
+add it to the provider's `options` as `"apiKey": "..."`. When OpenCode runs on another host, use a
+reachable relay address or an SSH tunnel; do not expose the unauthenticated HTTP listener to an
+untrusted network.
 
 ### Proxmox VE
 
@@ -88,7 +138,9 @@ The model runs inside a kernel whose only interface is a line-based console, so 
 - **One request at a time.** The kernel has one KV cache. Others queue (up to `LLM_MAX_WAITING`), then get 429.
 - **Requests are independent.** The relay sends `/clear` before each one.
 - **Messages become one line.** The console applies Qwen3's chat template to a single user turn. System and developer messages become a leading `Instructions:` sentence, and earlier turns become `Earlier conversation: User: ... Assistant: ...` ahead of the last user message. Newlines become spaces. If the line is too long, the oldest turns go first; the last user message is never cut, and a request whose last message alone is too long gets a 400.
-- **Sampling is fixed at boot.** `max_tokens`, `temperature`, `top_p` and `seed` come from the kernel command line (`max_tokens=`, `temp=`, `topp=`, `seed=`). Per-request values are accepted and ignored. Stop sequences, `n` above 1, tools, JSON mode, images and embeddings are not supported.
+- **Sampling is fixed at boot.** `max_tokens`, `temperature`, `top_p` and `seed` come from the kernel command line (`max_tokens=`, `temp=`, `topp=`, `seed=`). Per-request values are accepted and ignored. Stop sequences, `n` above 1, JSON mode, images and embeddings are not supported.
+- **Tool calls are text-protocol calls.** The relay forwards supported function names and compact parameter signatures to Qwen3, parses valid `<tool_call>` blocks into OpenAI `tool_calls`, and includes prior calls and tool results in later prompts. Invalid or undeclared calls remain ordinary assistant text. The 1000-byte console line limits how many tool signatures and prior messages fit.
+- **HTTP requests require JSON.** POST requests must use `Content-Type: application/json`.
 - **Console commands are refused.** A prompt that is exactly `exit`, `/halt`, `/quit`, `/clear` or another console command gets a 400 (some of them power the VM off), and control bytes are stripped.
 - `usage.prompt_tokens` counts the chat template's tokens too.
 

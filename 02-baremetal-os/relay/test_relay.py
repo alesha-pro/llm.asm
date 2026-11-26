@@ -34,9 +34,11 @@ def free_port():
 class FakeConsole(threading.Thread):
     """Connects to the relay like QEMU's chardev client and plays the llm.asm REPL."""
 
-    def __init__(self, port, banner=True, answer_delay=0.0, think=True):
+    def __init__(self, port, banner=True, answer_delay=0.0, think=True, response=None, responses=None):
         super().__init__(daemon=True)
         self.port, self.banner, self.answer_delay, self.think = port, banner, answer_delay, think
+        self.response = response
+        self.responses = list(responses or [])
         self.lines = []             # every line the relay typed
         self.powered_off = False
         self.sock = None
@@ -72,7 +74,11 @@ class FakeConsole(threading.Thread):
                         return
                     else:
                         time.sleep(self.answer_delay)
-                        body = ("<think>\n\n</think>\n\n" if self.think else "") + "Reply to: " + t
+                        if self.responses:
+                            body = self.responses.pop(0)
+                        else:
+                            body = self.response if self.response is not None else "Reply to: " + t
+                        body = ("<think>\n\n</think>\n\n" if self.think else "") + body
                         raw = body.encode()
                         for i in range(0, len(raw), 5):     # stream in small pieces, like tokens
                             s.sendall(raw[i:i + 5])
@@ -114,8 +120,9 @@ class RelayTest(unittest.TestCase):
     def tearDown(self):
         if self.console:
             self.console.close()
-        self.proc.terminate()
-        self.proc.wait(5)
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait(5)
 
     # helpers
     def _wait(self, cond, timeout=10):
@@ -140,9 +147,9 @@ class RelayTest(unittest.TestCase):
         self.console.start()
         self._wait(lambda: self._status("/healthz") == 200)
 
-    def _post(self, path, body):
+    def _post(self, path, body, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+                                     headers=headers or {"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 return r.status, r.read().decode()
@@ -165,6 +172,12 @@ class RelayTest(unittest.TestCase):
             data = json.loads(r.read())
         self.assertEqual(data["object"], "list")
         self.assertEqual(data["data"][0]["id"], "qwen3-0.6b-llm.asm")
+
+    def test_version_and_help(self):
+        version = subprocess.check_output([sys.executable, RELAY, "--version"], text=True).strip()
+        self.assertEqual(version, "llm-relay 0.2.0")
+        help_text = subprocess.check_output([sys.executable, RELAY, "--help"], text=True)
+        self.assertIn("OpenAI-compatible serial relay", help_text)
 
     def test_chat_completion(self):
         self._connect()
@@ -206,7 +219,7 @@ class RelayTest(unittest.TestCase):
         self._connect()
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps({
             "messages": [{"role": "user", "content": "Stream café"}], "stream": True,
-            "stream_options": {"include_usage": True}}).encode())
+            "stream_options": {"include_usage": True}}).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=20) as r:
             self.assertEqual(r.headers["Content-Type"], "text/event-stream")
             events = [l[6:] for l in r.read().decode().splitlines() if l.startswith("data: ")]
@@ -218,6 +231,60 @@ class RelayTest(unittest.TestCase):
         self.assertGreater(len(chunks), 3)                                  # arrived in pieces
         self.assertEqual(chunks[-2]["choices"][0]["finish_reason"], "stop")
         self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 9)
+
+    def test_tool_call_completion(self):
+        self._connect(think=False, response='<tool_call>{"name":"read","arguments":{"filePath":"README.md"}}</tool_call>')
+        tools = [{"type": "function", "function": {
+            "name": "read", "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}},
+                           "required": ["filePath"]}}}]
+        code, body = self._chat([{"role": "user", "content": "Read README.md"}], tools=tools)
+        self.assertEqual(code, 200)
+        message = body["choices"][0]["message"]
+        self.assertIsNone(message["content"])
+        self.assertEqual(message["tool_calls"][0]["function"],
+                         {"name": "read", "arguments": '{"filePath":"README.md"}'})
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        self.assertIn("Available tools: read(filePath:string!)", self.console.lines[-1])
+
+    def test_streamed_tool_call(self):
+        self._connect(think=False, response='I will read that. <tool_call>{"name":"read","arguments":{"filePath":"README.md"}}</tool_call>')
+        tools = [{"type": "function", "function": {
+            "name": "read", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}},
+                                               "required": ["filePath"]}}}]
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps({
+            "messages": [{"role": "user", "content": "Read README.md"}], "tools": tools, "stream": True,
+        }).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            events = [line[6:] for line in r.read().decode().splitlines() if line.startswith("data: ")]
+        chunks = [json.loads(event) for event in events[:-1]]
+        deltas = [choice["delta"] for chunk in chunks for choice in chunk.get("choices", [])]
+        self.assertIn("I will read that.", "".join(delta.get("content", "") for delta in deltas))
+        tool_delta = next(delta["tool_calls"][0] for delta in deltas if "tool_calls" in delta)
+        self.assertEqual(tool_delta["function"]["name"], "read")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_unadvertised_tool_stays_text(self):
+        self._connect(think=False, response='<tool_call>{"name":"delete","arguments":{}}</tool_call>')
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]
+        code, body = self._chat([{"role": "user", "content": "Read"}], tools=tools)
+        self.assertEqual(code, 200)
+        message = body["choices"][0]["message"]
+        self.assertNotIn("tool_calls", message)
+        self.assertIn('<tool_call>{"name":"delete"', message["content"])
+
+    def test_tool_result_is_folded_into_next_turn(self):
+        self._connect(think=False)
+        code, _ = self._chat([
+            {"role": "user", "content": "Read file"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function",
+             "function": {"name": "read", "arguments": '{"filePath":"README.md"}'}}]},
+            {"role": "tool", "name": "read", "tool_call_id": "call_1", "content": "README contents"},
+            {"role": "user", "content": "Summarize it"}],
+            tools=[{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}])
+        self.assertEqual(code, 200)
+        self.assertIn("Assistant called read", self.console.lines[-1])
+        self.assertIn("Tool result (read): README contents", self.console.lines[-1])
 
     def test_completions_and_generate(self):
         self._connect(think=False)
@@ -259,6 +326,26 @@ class RelayTest(unittest.TestCase):
             self.assertEqual(code, want, body)
         self.assertEqual(self._status("/v1/nothing"), 404)
 
+    def test_post_requires_json_content_type(self):
+        req = urllib.request.Request(self.base + "/v1/chat/completions",
+                                     data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
+                                     headers={"Content-Type": "text/plain"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(caught.exception.code, 415)
+
+    def test_metrics_path_labels_are_bounded(self):
+        for i in range(20):
+            self._status("/not-found-%d" % i)
+        with urllib.request.urlopen(self.base + "/metrics", timeout=5) as r:
+            data = r.read().decode()
+        self.assertIn('path="/other"', data)
+        self.assertLessEqual(data.count("llm_relay_requests_total{path="), 2)
+
+    def test_sigterm_shuts_down_cleanly(self):
+        self.proc.terminate()
+        self.assertEqual(self.proc.wait(5), 0)
+
     def test_one_at_a_time_and_queue_limit(self):
         self._connect(think=False, answer_delay=0.3)
         results = {}
@@ -278,7 +365,7 @@ class RelayTest(unittest.TestCase):
         for i in ok:                                                        # no crossed answers
             self.assertEqual(results[i][1]["choices"][0]["message"]["content"], "Reply to: question %d" % i)
 
-    def test_relay_restart_while_vm_at_prompt(self):
+    def test_relay_reconnect_pokes_vm_at_prompt(self):
         self._connect(banner=False)        # prints nothing on connect; the relay must poke it
         self.assertEqual(self.console.lines[0], "")
 

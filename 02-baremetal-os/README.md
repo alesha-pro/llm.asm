@@ -141,7 +141,7 @@ qm terminal 250
 
 ### Option D: OpenAI-Compatible API over the Serial Console
 
-The OS has no network driver, but its COM1 console is enough to serve it over HTTP. [`relay/`](relay/) is a single-file, standard-library Python relay: QEMU connects COM1 to it as a TCP client (`-chardev socket,...,reconnect-ms=5000 -serial chardev:...`), and it serves `/v1/models`, `/v1/chat/completions` and `/v1/completions` (with streaming), so any OpenAI client or chat UI can talk to the bare-metal model:
+The OS has no network driver, but its COM1 console is enough to serve it over HTTP. [`relay/`](relay/) is a single-file, standard-library Python relay: QEMU connects COM1 to it as a TCP client (`-chardev socket,...,reconnect-ms=5000 -serial chardev:...`), and it serves `/v1/models`, `/v1/chat/completions` and `/v1/completions` (with streaming and Qwen3 function tool calls), so OpenAI clients such as OpenCode can talk to the bare-metal model:
 
 ```bash
 LLM_BOOT_MAX_TOKENS=256 python3 02-baremetal-os/relay/llm-relay.py &
@@ -153,7 +153,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   -d '{"model":"qwen3-0.6b-llm.asm","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-See [relay/README.md](relay/README.md) for Proxmox setup, configuration, and how chat messages map onto the one-line console.
+See [relay/README.md](relay/README.md) for Proxmox setup, OpenCode configuration, tool-call limits, and how chat messages map onto the one-line console.
 
 ---
 

@@ -27,17 +27,22 @@ Prompt text is never logged; the log has sizes, token counts and timings only.
 Python 3.8+ standard library only. Configuration is by environment variable (see CONFIG below).
 """
 import codecs
+import argparse
 import json
 import os
 import re
 import secrets
 import socket
+import signal
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+VERSION = "0.2.0"
 
-def env(name, default):
+
+def env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
@@ -62,12 +67,18 @@ CONFIG = {
     "cmd_timeout": float(env("LLM_CMD_TIMEOUT", "15")),
 }
 MAX_BODY = 65536
+MAX_CONSOLE_BUF = 1 << 20
+CONSOLE_BUF_KEEP = 1 << 19
 STARTED = int(time.time())
 
 PROMPT = b"\nasm-llm> "
 POWEROFF = b"Powering off"
 TRAILER = b"\n[asm-llm-os] prefill: "
 COMMANDS = {"exit", "/halt", "/quit", "/clear", "/new", "/reset", "/think", "/nothink", "/bench", "/help"}
+KNOWN_PATHS = frozenset(("/healthz", "/metrics", "/v1/models", "/v1/chat/completions",
+                         "/v1/completions", "/v1/generate"))
+TOOL_OPEN = "<tool_call>"
+TOOL_CLOSE = "</tool_call>"
 STATS = re.compile(
     rb"\[asm-llm-os\] prefill: (\d+) tok in ([\d.]+) ms \(([\d.]+) tok/s\)\r?\n"
     rb"\[asm-llm-os\] decode : (\d+) tok in ([\d.]+) ms \(([\d.]+) tok/s, cores=(\d+)\) ctx=(\d+)/(\d+)\r?\n"
@@ -94,6 +105,8 @@ class Console:
     def __init__(self):
         self.cv = threading.Condition()
         self.conn = None
+        self.listener = None
+        self.stopping = threading.Event()
         self.gen = 0            # bumps on every (re)connect, so waiters notice
         self.buf = bytearray()
         self.ready = False
@@ -106,10 +119,16 @@ class Console:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((CONFIG["serial_addr"], CONFIG["serial_port"]))
         srv.listen(2)
+        self.listener = srv
         log("serial listening on %s:%d, peers %s" % (CONFIG["serial_addr"], CONFIG["serial_port"],
                                                      ",".join(CONFIG["serial_peers"])))
-        while True:
-            c, (ip, _) = srv.accept()
+        while not self.stopping.is_set():
+            try:
+                c, (ip, _) = srv.accept()
+            except OSError:
+                if self.stopping.is_set():
+                    break
+                raise
             if ip not in CONFIG["serial_peers"]:
                 log("serial: refused connection from %s" % ip)
                 c.close()
@@ -132,6 +151,28 @@ class Console:
             log("serial: console connected")
             threading.Thread(target=self._reader, args=(c, gen), daemon=True).start()
             threading.Thread(target=self._poke, args=(gen,), daemon=True).start()
+        srv.close()
+
+    def stop(self):
+        self.stopping.set()
+        with self.cv:
+            if self.conn:
+                try:
+                    self.conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self.conn.close()
+                except OSError:
+                    pass
+                self.conn = None
+            self.ready = False
+            self.cv.notify_all()
+        if self.listener:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
 
     def _reader(self, c, gen):
         while True:
@@ -149,8 +190,8 @@ class Console:
                     log("serial: console disconnected")
                     return
                 self.buf += data
-                if len(self.buf) > 1 << 20:          # never hold more than 1 MiB of console output
-                    del self.buf[: len(self.buf) - (1 << 19)]
+                if len(self.buf) > MAX_CONSOLE_BUF:  # never hold more than 1 MiB of console output
+                    del self.buf[: len(self.buf) - CONSOLE_BUF_KEEP]
                 if POWEROFF in self.buf:
                     if not self.powered_off:
                         self.poweroffs += 1
@@ -270,7 +311,12 @@ gen_tokens_total = 0
 
 
 class ThinkFilter:
-    """Qwen3 may open with an empty <think></think> block; drop a leading one from the text."""
+    """Drop a leading Qwen3 think block from visible text.
+
+    This assumes a leading <think> block is reasoning, even when it contains text. If the model
+    emits a literal <think> in its answer without a matching </think>, it remains buffered until
+    the generation ends and is then returned unchanged.
+    """
 
     def __init__(self):
         self.held = ""
@@ -381,7 +427,7 @@ def text_of(content):
     raise RelayError(400, "message content must be a string or a list of text parts", "invalid_request_error")
 
 
-def chat_to_line(messages):
+def chat_to_line(messages, tools_text=""):
     """The console takes one user line per turn and applies Qwen3's chat template itself. So:
     the last message must be from the user; system and developer messages become a leading
     "Instructions:" sentence; earlier turns become "Earlier conversation: User: ... Assistant: ...".
@@ -391,18 +437,31 @@ def chat_to_line(messages):
     for m in messages:
         if not isinstance(m, dict) or not isinstance(m.get("role"), str):
             raise RelayError(400, "each message needs a role", "invalid_request_error")
-    if messages[-1]["role"] != "user":
-        raise RelayError(400, "the last message must have role user", "invalid_request_error")
+    if messages[-1]["role"] not in ("user", "tool"):
+        raise RelayError(400, "the last message must have role user or tool", "invalid_request_error")
     system = [one_line(text_of(m.get("content"))) for m in messages if m["role"] in ("system", "developer")]
-    turns = []
+    turns = deque()
     for m in messages[:-1]:
         if m["role"] in ("user", "assistant"):
             t = one_line(text_of(m.get("content")))
             if t:
                 turns.append(("User: " if m["role"] == "user" else "Assistant: ") + t)
+            for call in m.get("tool_calls", []) if m["role"] == "assistant" else ():
+                fn = call.get("function", {}) if isinstance(call, dict) else {}
+                name = fn.get("name")
+                args = fn.get("arguments", "{}")
+                if isinstance(name, str):
+                    turns.append("Assistant called %s with %s" % (name, one_line(args if isinstance(args, str) else json.dumps(args, separators=(",", ":")))))
+        elif m["role"] == "tool":
+            t = one_line(text_of(m.get("content")))
+            if t:
+                turns.append("Tool result (%s): %s" % (one_line(m.get("name") or "tool"), t))
         elif m["role"] not in ("system", "developer"):
             raise RelayError(400, "role %s is not supported" % m["role"], "invalid_request_error")
-    last = one_line(text_of(messages[-1].get("content")))
+    last_message = messages[-1]
+    last = one_line(text_of(last_message.get("content")))
+    if last_message["role"] == "tool":
+        last = "Tool result (%s): %s" % (one_line(last_message.get("name") or "tool"), last)
     if not last:
         raise RelayError(400, "the last user message is empty", "invalid_request_error")
     sys_text = " ".join(s for s in system if s)
@@ -411,16 +470,154 @@ def chat_to_line(messages):
         pieces = []
         if sys_text:
             pieces.append("Instructions: " + sys_text)
+        if tools_text:
+            pieces.append(tools_text)
         if turns:
             pieces.append("Earlier conversation: " + " ".join(turns) + " Now answer:")
         pieces.append(last)
         line = " ".join(pieces)
         if len(line.encode("utf-8")) <= limit or not turns:
             break
-        turns.pop(0)
+        turns.popleft()
     if len(line.encode("utf-8")) > limit and sys_text:
-        line = last                         # instructions do not fit beside the question
+        pieces = ([tools_text] if tools_text else [])
+        if turns:
+            pieces.append("Earlier conversation: " + " ".join(turns) + " Now answer:")
+        pieces.append(last)
+        line = " ".join(pieces)             # system instructions do not fit beside the tools and question
     return check_line(line)
+
+
+def _tool_signatures(tools):
+    """Reduce OpenAI function schemas to compact signatures that fit the console's one-line input."""
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        raise RelayError(400, "tools must be an array", "invalid_request_error")
+    signatures = []
+    seen = set()
+    for item in tools:
+        if not isinstance(item, dict) or item.get("type", "function") != "function":
+            raise RelayError(400, "only function tools are supported", "invalid_request_error")
+        fn = item.get("function")
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+            raise RelayError(400, "each tool needs a function name", "invalid_request_error")
+        name = fn["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+            raise RelayError(400, "tool names must contain only letters, digits, _ or -", "invalid_request_error")
+        if name in seen:
+            raise RelayError(400, "tool names must be unique", "invalid_request_error")
+        seen.add(name)
+        params = fn.get("parameters", {})
+        if not isinstance(params, dict):
+            raise RelayError(400, "tool parameters must be a JSON schema object", "invalid_request_error")
+        props = params.get("properties", {})
+        required = params.get("required", [])
+        if not isinstance(props, dict) or not isinstance(required, list):
+            raise RelayError(400, "tool parameters need object properties and a required array", "invalid_request_error")
+        args = []
+        for key, spec in props.items():
+            if not isinstance(key, str) or not isinstance(spec, dict):
+                continue
+            typ = spec.get("type", "value")
+            if isinstance(typ, list):
+                typ = "/".join(str(x) for x in typ)
+            arg = "%s:%s" % (key, typ)
+            if key in required:
+                arg += "!"
+            args.append(arg)
+        signatures.append("%s(%s)" % (name, ",".join(args)))
+    return signatures
+
+
+def chat_to_line_with_tools(messages, signatures, required=False, forced=None):
+    """Fit the conversation and compact tool signatures into the console's bounded input line."""
+    if not signatures:
+        return chat_to_line(messages), set()
+    allowed = set()
+    selected = list(signatures)
+    if forced:
+        selected = [s for s in signatures if s.startswith(forced + "(")]
+        if not selected:
+            raise RelayError(400, "tool_choice names an undeclared function", "invalid_request_error")
+    active = list(selected)
+    while active:
+        instructions = "Available tools: %s. Call using %s{\"name\":\"tool_name\",\"arguments\":{...}}%s." % (
+            "; ".join(active), TOOL_OPEN, TOOL_CLOSE)
+        if required:
+            instructions += " You must call one listed tool."
+        try:
+            line = chat_to_line(messages, tools_text=instructions)
+            allowed = {sig.split("(", 1)[0] for sig in active}
+            return line, allowed
+        except RelayError as e:
+            if e.code != "context_length_exceeded" or forced or len(active) == 1:
+                raise
+            active.pop()
+    raise RelayError(400, "tool definitions do not fit the console input limit", "invalid_request_error",
+                     "context_length_exceeded")
+
+
+class ToolCallFilter:
+    """Hide Qwen3 tool-call markup from text and convert valid calls to OpenAI call objects."""
+
+    def __init__(self, allowed):
+        self.allowed = set(allowed)
+        self.buffer = ""
+        self.in_call = False
+
+    def _parse(self, raw):
+        try:
+            obj = json.loads(raw.strip())
+            name = obj.get("name") if isinstance(obj, dict) else None
+            args = obj.get("arguments", {}) if isinstance(obj, dict) else None
+            if isinstance(args, str):
+                args = json.loads(args)
+            if name not in self.allowed or not isinstance(args, dict):
+                return None
+            return {"id": "call_" + secrets.token_hex(12), "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}}
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    def feed(self, piece):
+        self.buffer += piece
+        out = []
+        while True:
+            if self.in_call:
+                end = self.buffer.find(TOOL_CLOSE)
+                if end < 0:
+                    break
+                raw = self.buffer[:end]
+                self.buffer = self.buffer[end + len(TOOL_CLOSE):]
+                self.in_call = False
+                call = self._parse(raw)
+                if call:
+                    out.append(("tool", call))
+                else:
+                    out.append(("text", TOOL_OPEN + raw + TOOL_CLOSE))
+                continue
+            start = self.buffer.find(TOOL_OPEN)
+            if start >= 0:
+                if start:
+                    out.append(("text", self.buffer[:start]))
+                self.buffer = self.buffer[start + len(TOOL_OPEN):]
+                self.in_call = True
+                continue
+            keep = min(len(TOOL_OPEN) - 1, len(self.buffer))
+            if len(self.buffer) > keep:
+                out.append(("text", self.buffer[:-keep] if keep else self.buffer))
+                self.buffer = self.buffer[-keep:] if keep else ""
+            break
+        return out
+
+    def finish(self):
+        if self.in_call:
+            self.buffer = TOOL_OPEN + self.buffer
+        result = [("text", self.buffer)] if self.buffer else []
+        self.buffer = ""
+        self.in_call = False
+        return result
 
 
 def finish_reason(stats):
@@ -436,19 +633,21 @@ def usage(stats):
 # HTTP
 # ---------------------------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
-    server_version = "llm-relay"
+    server_version = "llm-relay/" + VERSION
     sys_version = ""
 
     def log_message(self, fmt, *args):
         pass  # one line per request comes from _done, without prompt text
 
     def _done(self, code, note=""):
-        if self.path == "/metrics":
+        path = self.path.split("?", 1)[0]
+        if path == "/metrics":
             return
-        key = (self.path, code)
+        label_path = path if path in KNOWN_PATHS else "/other"
+        key = (label_path, code)
         with stats_lock:
             counts[key] = counts.get(key, 0) + 1
-        log(("%s %s %s %d %s" % (self.client_address[0], self.command, self.path, code, note)).rstrip())
+        log(("%s %s %s %d %s" % (self.client_address[0], self.command, label_path, code, note)).rstrip())
 
     def _json(self, code, body, note=""):
         data = (json.dumps(body, ensure_ascii=False) + "\n").encode()
@@ -470,6 +669,8 @@ class Handler(BaseHTTPRequestHandler):
         return got.startswith("Bearer ") and secrets.compare_digest(got[7:].strip(), key)
 
     def _body(self):
+        if self.headers.get_content_type() != "application/json":
+            raise RelayError(415, "Content-Type must be application/json", "invalid_request_error")
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -538,7 +739,8 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self, req):
         if req.get("n", 1) != 1:
             raise RelayError(400, "only n=1 is supported", "invalid_request_error")
-        pb = chat_to_line(req.get("messages"))
+        signatures, required, forced = request_tools(req)
+        pb, allowed = chat_to_line_with_tools(req.get("messages"), signatures, required, forced)
         model = req.get("model") or CONFIG["model_id"]
         cid = "chatcmpl-" + secrets.token_hex(12)
         created = int(time.time())
@@ -551,20 +753,42 @@ class Handler(BaseHTTPRequestHandler):
             self._sse(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""},
                                            "finish_reason": None}]))
             stats = None
+            parser = ToolCallFilter(allowed)
+            calls = 0
             for item in self._chain(first, stream):
                 if isinstance(item, dict):
                     stats = item
                 else:
-                    self._sse(dict(base, choices=[{"index": 0, "delta": {"content": item}, "finish_reason": None}]))
-            self._sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": finish_reason(stats)}]))
+                    for kind, value in parser.feed(item):
+                        if kind == "text":
+                            self._sse(dict(base, choices=[{"index": 0, "delta": {"content": value}, "finish_reason": None}]))
+                        else:
+                            self._sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [
+                                {"index": calls, "id": value["id"], "type": "function",
+                                 "function": value["function"]}]}, "finish_reason": None}]))
+                            calls += 1
+            for kind, value in parser.finish():
+                if kind == "text":
+                    self._sse(dict(base, choices=[{"index": 0, "delta": {"content": value}, "finish_reason": None}]))
+                else:
+                    self._sse(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [
+                        {"index": calls, "id": value["id"], "type": "function",
+                         "function": value["function"]}]}, "finish_reason": None}]))
+                    calls += 1
+            reason = "tool_calls" if calls else finish_reason(stats)
+            self._sse(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": reason}]))
             if include_usage:
                 self._sse(dict(base, choices=[], usage=usage(stats)))
             return self._sse_end(200, self._note(pb, stats))
         text, stats = answer(pb)
+        content, calls = tool_response(text, allowed)
+        message = {"role": "assistant", "content": content or None}
+        if calls:
+            message["tool_calls"] = calls
         self._json(200, {
             "id": cid, "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": finish_reason(stats)}],
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": "tool_calls" if calls else finish_reason(stats)}],
             "usage": usage(stats),
         }, self._note(pb, stats))
 
@@ -646,6 +870,33 @@ def model_card():
     return {"id": CONFIG["model_id"], "object": "model", "created": STARTED, "owned_by": "llm.asm"}
 
 
+def request_tools(req):
+    signatures = _tool_signatures(req.get("tools"))
+    choice = req.get("tool_choice", "auto")
+    if choice == "none":
+        return [], False, None
+    if choice in ("auto", None):
+        return signatures, False, None
+    if choice == "required":
+        if not signatures:
+            raise RelayError(400, "tool_choice requires at least one function tool", "invalid_request_error")
+        return signatures, True, None
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        fn = choice.get("function")
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+            raise RelayError(400, "tool_choice function needs a name", "invalid_request_error")
+        return signatures, True, fn["name"]
+    raise RelayError(400, "tool_choice must be auto, none, required, or a named function", "invalid_request_error")
+
+
+def tool_response(text, allowed):
+    parser = ToolCallFilter(allowed)
+    events = parser.feed(text) + parser.finish()
+    content = "".join(value for kind, value in events if kind == "text").strip()
+    calls = [value for kind, value in events if kind == "tool"]
+    return content, calls
+
+
 def metrics():
     with stats_lock:
         lines = [
@@ -677,12 +928,25 @@ def metrics():
 
 
 def main():
-    threading.Thread(target=console.serve, daemon=True).start()
+    parser = argparse.ArgumentParser(description="OpenAI-compatible serial relay for the llm.asm bare-metal OS")
+    parser.add_argument("-V", "--version", action="version", version="llm-relay %s" % VERSION)
+    parser.parse_args()
     httpd = ThreadingHTTPServer((CONFIG["http_addr"], CONFIG["http_port"]), Handler)
-    httpd.daemon_threads = True
+    httpd.daemon_threads = False
+    threading.Thread(target=console.serve, daemon=True).start()
     log("http listening on %s:%d, model %s, api key %s" % (CONFIG["http_addr"], CONFIG["http_port"],
                                                            CONFIG["model_id"], "required" if CONFIG["api_key"] else "off"))
-    httpd.serve_forever()
+    def request_shutdown(signum, frame):
+        log("shutdown requested")
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()       # with non-daemon request threads, let in-flight requests finish
+        console.stop()
+        log("relay stopped")
 
 
 if __name__ == "__main__":
