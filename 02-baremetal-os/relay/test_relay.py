@@ -273,6 +273,18 @@ class RelayTest(unittest.TestCase):
         self.assertNotIn("tool_calls", message)
         self.assertIn('<tool_call>{"name":"delete"', message["content"])
 
+    def test_forced_tool_that_does_not_fit_is_named_in_error(self):
+        self._connect(think=False)
+        name = "read_file"
+        prop = "p" * 1000
+        tools = [{"type": "function", "function": {"name": name,
+                 "parameters": {"type": "object", "properties": {prop: {"type": "string"}}}}}]
+        code, body = self._chat([{"role": "user", "content": "Read the file."}], tools=tools,
+                                tool_choice={"type": "function", "function": {"name": name}})
+        self.assertEqual(code, 400)
+        self.assertIn(name, body["error"]["message"])
+        self.assertIn("console input limit", body["error"]["message"])
+
     def test_tool_result_is_folded_into_next_turn(self):
         self._connect(think=False)
         code, _ = self._chat([

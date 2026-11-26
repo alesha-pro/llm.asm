@@ -90,7 +90,8 @@ the request. The relay condenses that request to one console line (at most 1000 
 the bare-metal kernel still uses its 2048-token context. If `LLM_API_KEY` is set for the relay,
 add it to the provider's `options` as `"apiKey": "..."`. When OpenCode runs on another host, use a
 reachable relay address or an SSH tunnel; do not expose the unauthenticated HTTP listener to an
-untrusted network.
+untrusted network. The example was verified with OpenCode v2.3.0; other versions may use a different
+custom-provider configuration schema.
 
 ### Proxmox VE
 
@@ -117,6 +118,7 @@ All settings are environment variables.
 | `LLM_MAX_PROMPT_BYTES` | `1000` | The longest line sent to the console (the console holds 1023 bytes) |
 | `LLM_MAX_WAITING` | `4` | Requests that may queue; more get 429 |
 | `LLM_GEN_TIMEOUT` | `120` | Seconds to wait for an answer |
+| `LLM_CMD_TIMEOUT` | `15` | Seconds to wait for the console to accept a command |
 
 ## API
 

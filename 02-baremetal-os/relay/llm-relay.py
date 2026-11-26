@@ -315,7 +315,8 @@ class ThinkFilter:
 
     This assumes a leading <think> block is reasoning, even when it contains text. If the model
     emits a literal <think> in its answer without a matching </think>, it remains buffered until
-    the generation ends and is then returned unchanged.
+    the generation ends and is then returned unchanged. Nested think tags are not balanced; the
+    first </think> closes the leading block.
     """
 
     def __init__(self):
@@ -551,8 +552,17 @@ def chat_to_line_with_tools(messages, signatures, required=False, forced=None):
             allowed = {sig.split("(", 1)[0] for sig in active}
             return line, allowed
         except RelayError as e:
-            if e.code != "context_length_exceeded" or forced or len(active) == 1:
+            if e.code != "context_length_exceeded":
                 raise
+            # Distinguish a tool that cannot fit from a prompt that is already too long.
+            try:
+                chat_to_line(messages)
+            except RelayError:
+                raise e
+            if forced or len(active) == 1:
+                name = forced or active[0].split("(", 1)[0]
+                raise RelayError(400, "tool '%s' could not fit alongside the prompt in the console input limit" % name,
+                                 "invalid_request_error", "context_length_exceeded")
             active.pop()
     raise RelayError(400, "tool definitions do not fit the console input limit", "invalid_request_error",
                      "context_length_exceeded")
