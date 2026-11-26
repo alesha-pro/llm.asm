@@ -89,7 +89,7 @@ TRAIN_OBJS := \
 	$(TRAIN_BUILD)/tui.o \
 	$(TRAIN_BUILD)/main.o
 
-.PHONY: all inference test-math check os os-qwen35 os-check os-iso os-run train train-check check-all clean
+.PHONY: all inference test-math check os os-qwen35 os-check os-iso os-iso-dual os-run train train-check check-all clean
 
 all: inference $(TEST) os train
 
@@ -165,6 +165,13 @@ os-check: $(OS_ELF)
 
 os-iso: $(OS_ELF)
 	bash scripts/mkiso.sh "$(OS_ELF)" "$(MODEL)" "$(OS_ISO)" '$(CMDLINE)'
+
+# One ISO with a GRUB menu: Qwen3-0.6B (default kernel) and Qwen3.5-2B (qwen35 kernel); needs a 4G+ VM
+MODEL2  ?= models/qwen35-2b-q8_0-v3.asmbin
+os-iso-dual:
+	$(MAKE) os
+	$(MAKE) os-qwen35
+	KERNEL2=$(BUILD)/asm-llm-os-qwen35.elf MODEL2=$(MODEL2) bash scripts/mkiso.sh $(BUILD)/asm-llm-os.elf models/qwen3-0.6b-q8_0.asmbin $(BUILD)/asm-llm-os-dual.iso '$(CMDLINE)'
 
 os-run: $(OS_ELF)
 	qemu-system-x86_64 -enable-kvm -cpu host -m $(RAM) -smp $(SMP) \

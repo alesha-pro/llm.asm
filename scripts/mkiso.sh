@@ -13,6 +13,9 @@ KERNEL_ELF="${1:?usage: mkiso.sh <asm-llm-os.elf> <model.asmbin> <out.iso> [cmdl
 MODEL_BIN="${2:?missing model.asmbin}"
 OUT_ISO="${3:?missing output .iso path}"
 CMDLINE="${4:-}"
+# Optional second GRUB entry (e.g. KERNEL2=build/asm-llm-os-qwen35.elf MODEL2=models/qwen35-2b-q8_0-v3.asmbin): shows a 5 s menu.
+KERNEL2="${KERNEL2:-}"
+MODEL2="${MODEL2:-}"
 
 if [[ ! -f "$KERNEL_ELF" ]]; then
     echo "error: kernel not found: $KERNEL_ELF" >&2
@@ -33,19 +36,35 @@ ISO_ROOT="$WORK_DIR/iso"
 mkdir -p "$ISO_ROOT/boot/grub"
 cp "$KERNEL_ELF" "$ISO_ROOT/boot/asm-llm-os.elf"
 
+# .asmbin v3 (Qwen3.5-2B) vs v1/v2 (Qwen3-0.6B), only for the menu title
+model_name() { [[ "$(od -An -tu4 -j4 -N4 "$1" | tr -d ' ')" == 3 ]] && echo "Qwen3.5-2B" || echo "Qwen3-0.6B"; }
+TIMEOUT=0
+ENTRY2=""
+if [[ -n "$KERNEL2" ]]; then
+    [[ -f "$KERNEL2" && -f "$MODEL2" ]] || { echo "error: KERNEL2/MODEL2 not found" >&2; exit 1; }
+    cp "$KERNEL2" "$ISO_ROOT/boot/asm-llm-os-2.elf"
+    TIMEOUT=5
+    ENTRY2="
+menuentry \"asm-llm OS v2.0 (Bare-Metal $(model_name "$MODEL2") in Pure x86-64 Assembly)\" {
+    multiboot /boot/asm-llm-os-2.elf ${CMDLINE}
+    module /boot/model2.asmbin
+    boot
+}"
+fi
+
 # Note: quote cmdline carefully for GRUB2 multiboot command
 cat > "$ISO_ROOT/boot/grub/grub.cfg" <<EOF
 serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1
 terminal_input console serial
 terminal_output console serial
-set timeout=0
+set timeout=${TIMEOUT}
 set default=0
 
-menuentry "asm-llm OS v2.0 (Bare-Metal Qwen3-0.6B in Pure x86-64 Assembly)" {
+menuentry "asm-llm OS v2.0 (Bare-Metal $(model_name "$MODEL_BIN") in Pure x86-64 Assembly)" {
     multiboot /boot/asm-llm-os.elf ${CMDLINE}
     module /boot/model.asmbin
     boot
-}
+}${ENTRY2}
 EOF
 
 # Path A: BIOS+UEFI hybrid ISO via grub-mkrescue
@@ -53,6 +72,7 @@ if [[ -d /usr/lib/grub/i386-pc ]] && command -v grub-mkrescue >/dev/null 2>&1; t
     echo "[mkiso] Building BIOS+UEFI hybrid ISO via grub-mkrescue..."
     cp --reflink=auto "$MODEL_BIN" "$ISO_ROOT/boot/model.asmbin" 2>/dev/null \
         || cp "$MODEL_BIN" "$ISO_ROOT/boot/model.asmbin"
+    [[ -z "$MODEL2" ]] || cp --reflink=auto "$MODEL2" "$ISO_ROOT/boot/model2.asmbin"
     grub-mkrescue -o "$OUT_ISO" "$ISO_ROOT"
     ls -lh "$OUT_ISO"
     exit 0
@@ -61,6 +81,7 @@ fi
 # Path B: UEFI GRUB Multiboot 1 ISO via grub-mkstandalone + xorriso (zero mtools/root)
 echo "[mkiso] Building UEFI GRUB Multiboot 1 ISO via grub-mkstandalone + xorriso..."
 ln -s "$(realpath "$MODEL_BIN")" "$ISO_ROOT/boot/model.asmbin"
+[[ -z "$MODEL2" ]] || ln -s "$(realpath "$MODEL2")" "$ISO_ROOT/boot/model2.asmbin"
 mkdir -p "$WORK_DIR/efi_tree/EFI/BOOT"
 
 cat > "$WORK_DIR/embed.cfg" <<'EOF'
