@@ -78,13 +78,14 @@ TRAIN_OBJS := \
 
 # --- Native Apple Silicon / AArch64 inference port ---
 ARM64_TARGET := $(BUILD)/asm-llm-arm64
+ARM64_METAL_TARGET := $(BUILD)/asm-llm-arm64-metal
 CXX ?= clang++
 CXXFLAGS ?= -O3 -std=c++20 -Wall -Wextra
 ARM64_MODEL ?= models/qwen3-0.6b-q8_0.asmbin
 ARM64_CTX ?= 2048
 ARM64_TOKENS ?= 128
 
-.PHONY: all inference test-math check os os-check os-iso os-run train train-check check-all arm64 arm64-run clean
+.PHONY: all inference test-math check os os-check os-iso os-run train train-check check-all arm64 arm64-run arm64-metal arm64-metal-run clean
 
 all: inference $(TEST) os train
 
@@ -189,6 +190,14 @@ arm64: $(ARM64_TARGET)
 
 arm64-run: $(ARM64_TARGET)
 	$(ARM64_TARGET) "$(ARM64_MODEL)" $(ARM64_CTX) $(ARM64_TOKENS)
+
+$(ARM64_METAL_TARGET): arm64/main.cpp arm64/metal_backend.mm arm64/metal_backend.h arm64/metal_matvec.metal | $(BUILD)
+	$(CXX) $(CXXFLAGS) -fobjc-arc -DASML_USE_METAL -DASML_METAL_SOURCE_PATH='"$(CURDIR)/arm64/metal_matvec.metal"' arm64/main.cpp arm64/metal_backend.mm -framework Foundation -framework Metal -o $@
+
+arm64-metal: $(ARM64_METAL_TARGET)
+
+arm64-metal-run: $(ARM64_METAL_TARGET)
+	$(ARM64_METAL_TARGET) "$(ARM64_MODEL)" $(ARM64_CTX) $(ARM64_TOKENS)
 
 check-all: check os-check train-check
 

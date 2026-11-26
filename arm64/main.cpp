@@ -17,6 +17,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef ASML_USE_METAL
+#include "metal_backend.h"
+#endif
 
 namespace {
 constexpr uint32_t kVocab = 151936;
@@ -130,7 +133,7 @@ int32_t dot32(const int8_t* a,const int8_t* b) {
     int32x4_t s=vaddq_s32(vaddq_s32(vpaddlq_s16(p0),vpaddlq_s16(p1)),vaddq_s32(vpaddlq_s16(p2),vpaddlq_s16(p3)));
     return vaddvq_s32(s);
 }
-void matvec(const Model& m,const Matrix& w,const float* x,float* y) {
+[[maybe_unused]] void matvec(const Model& m,const Matrix& w,const float* x,float* y) {
     QVec q=quantize(x,w.cols); const uint32_t blocks=w.cols/32;
     for(uint32_t r=0;r<w.rows;++r){const uint8_t* row=w.data+size_t(r)*w.row_stride;float sum=0;
         for(uint32_t b=0;b<blocks;++b){float ws=m.scale_bytes==2?fp16(row+w.cols+2*b):std::bit_cast<float>(u32(row+w.cols+4*b));sum+=float(dot32(reinterpret_cast<const int8_t*>(row+32*b),q.q.data()+32*b))*ws*q.s[b];} y[r]=sum;}
@@ -143,7 +146,56 @@ float silu(float x){if(x>=0.f)return x/(1.f+std::exp(-x));float e=std::exp(x);re
 struct Engine {
     const Model& m; uint32_t qdim, kvdim, maxseq; std::vector<float> x,xb,q,k,v,att,gate,up,logits,cosv,sinv;
     std::vector<float> kc,vc,scores; std::vector<double> invfreq;
-    explicit Engine(const Model& model,uint32_t ctx):m(model),qdim(m.n_heads*m.head_dim),kvdim(m.n_kv*m.head_dim),maxseq(std::min(ctx,m.max_seq)),x(m.dim),xb(m.dim),q(qdim),k(kvdim),v(kvdim),att(qdim),gate(m.hidden),up(m.hidden),logits(m.vocab),cosv(m.head_dim/2),sinv(m.head_dim/2),kc(size_t(m.n_layers)*m.n_kv*maxseq*m.head_dim),vc(kc.size()),scores(maxseq),invfreq(m.head_dim/2){for(uint32_t i=0;i<m.head_dim/2;++i)invfreq[i]=std::pow(double(m.rope_theta),-2.0*i/m.head_dim);}
+#ifdef ASML_USE_METAL
+    AsmlMetal* metal{};
+#endif
+    explicit Engine(const Model& model,uint32_t ctx):m(model),qdim(m.n_heads*m.head_dim),kvdim(m.n_kv*m.head_dim),maxseq(std::min(ctx,m.max_seq)),x(m.dim),xb(m.dim),q(qdim),k(kvdim),v(kvdim),att(qdim),gate(m.hidden),up(m.hidden),logits(m.vocab),cosv(m.head_dim/2),sinv(m.head_dim/2),kc(size_t(m.n_layers)*m.n_kv*maxseq*m.head_dim),vc(kc.size()),scores(maxseq),invfreq(m.head_dim/2){for(uint32_t i=0;i<m.head_dim/2;++i)invfreq[i]=std::pow(double(m.rope_theta),-2.0*i/m.head_dim);
+#ifdef ASML_USE_METAL
+        char error[512]{};
+        const char* source=std::getenv("ASML_METAL_SOURCE");
+        if(!source||!*source)source=ASML_METAL_SOURCE_PATH;
+        metal=asml_metal_create(m.file.data(),m.file.size(),source,error,sizeof(error));
+        if(!metal)throw std::runtime_error(std::string("Metal initialization failed: ")+error);
+#endif
+    }
+    ~Engine(){
+#ifdef ASML_USE_METAL
+        asml_metal_destroy(metal);
+#endif
+    }
+    void project(const Matrix& w,const float* input,float* output){
+#ifdef ASML_USE_METAL
+        QVec qinput=quantize(input,w.cols);char error[512]{};
+        size_t offset=size_t(w.data-m.file.data());
+        if(!asml_metal_matvec(metal,offset,w.rows,w.cols,w.row_stride,m.scale_bytes,
+                              qinput.q.data(),qinput.s.data(),output,error,sizeof(error)))
+            throw std::runtime_error(std::string("Metal matvec failed: ")+error);
+#else
+        matvec(m,w,input,output);
+#endif
+    }
+    template<size_t N> void project_batch(const std::array<Matrix,N>& matrices,const float* input,
+                                           const std::array<float*,N>& outputs){
+#ifdef ASML_USE_METAL
+        QVec qinput=quantize(input,matrices[0].cols);
+        std::array<AsmlMetalMatrix,N> descriptors{};
+        uint32_t total_rows=0;
+        for(size_t i=0;i<N;++i){
+            if(matrices[i].cols!=matrices[0].cols)throw std::runtime_error("batched Metal projections need matching input sizes");
+            descriptors[i]={size_t(matrices[i].data-m.file.data()),matrices[i].row_stride,
+                            matrices[i].rows,total_rows};
+            total_rows+=matrices[i].rows;
+        }
+        std::vector<float> combined(total_rows);char error[512]{};
+        if(!asml_metal_matvec_batch(metal,descriptors.data(),N,matrices[0].cols,m.scale_bytes,
+                                    qinput.q.data(),qinput.s.data(),combined.data(),error,sizeof(error)))
+            throw std::runtime_error(std::string("Metal batched matvec failed: ")+error);
+        for(size_t i=0;i<N;++i)
+            std::copy_n(combined.data()+descriptors[i].output_offset,matrices[i].rows,outputs[i]);
+#else
+        for(size_t i=0;i<N;++i)project(matrices[i],input,outputs[i]);
+#endif
+    }
     float* cache(std::vector<float>& c,uint32_t l,uint32_t h,uint32_t pos){return c.data()+(((size_t(l)*m.n_kv+h)*maxseq+pos)*m.head_dim);}
     void forward(uint32_t tok,uint32_t pos,bool calc){
         if(pos>=maxseq)throw std::runtime_error("context full; clear the conversation");
@@ -151,7 +203,9 @@ struct Engine {
         for(uint32_t i=0;i<m.head_dim/2;++i){double a=double(pos)*invfreq[i];cosv[i]=float(std::cos(a));sinv[i]=float(std::sin(a));}
         float scale=1.f/std::sqrt(float(m.head_dim));
         for(uint32_t l=0;l<m.n_layers;++l){std::array<const float*,4> n;auto w=m.layer_mats(l,n);
-            rmsnorm(xb.data(),x.data(),n[0],m.dim,m.eps);matvec(m,w[0],xb.data(),q.data());matvec(m,w[1],xb.data(),k.data());matvec(m,w[2],xb.data(),v.data());
+            rmsnorm(xb.data(),x.data(),n[0],m.dim,m.eps);
+            project_batch(std::array<Matrix,3>{w[0],w[1],w[2]},xb.data(),
+                          std::array<float*,3>{q.data(),k.data(),v.data()});
             for(uint32_t h=0;h<m.n_heads;++h)rmsnorm(q.data()+size_t(h)*m.head_dim,q.data()+size_t(h)*m.head_dim,n[1],m.head_dim,m.eps);
             for(uint32_t h=0;h<m.n_kv;++h)rmsnorm(k.data()+size_t(h)*m.head_dim,k.data()+size_t(h)*m.head_dim,n[2],m.head_dim,m.eps);
             auto rope=[&](float* a,uint32_t heads){for(uint32_t h=0;h<heads;++h){float* z=a+size_t(h)*m.head_dim;for(uint32_t i=0;i<m.head_dim/2;++i){float x0=z[i],x1=z[i+m.head_dim/2];z[i]=x0*cosv[i]-x1*sinv[i];z[i+m.head_dim/2]=x1*cosv[i]+x0*sinv[i];}}};rope(q.data(),m.n_heads);rope(k.data(),m.n_kv);
@@ -182,15 +236,18 @@ struct Engine {
                 std::fill_n(out,m.head_dim,0.f);
                 for(uint32_t t=0;t<=pos;++t){float p=scores[t];const float* vv=cache(vc,l,kh,t);for(uint32_t d=0;d<m.head_dim;++d)out[d]+=p*vv[d];}
             }
-            matvec(m,w[3],att.data(),xb.data());add(x.data(),xb.data(),m.dim);
-            rmsnorm(xb.data(),x.data(),n[3],m.dim,m.eps);matvec(m,w[4],xb.data(),gate.data());matvec(m,w[5],xb.data(),up.data());for(uint32_t i=0;i<m.hidden;++i)gate[i]=silu(gate[i])*up[i];matvec(m,w[6],gate.data(),xb.data());add(x.data(),xb.data(),m.dim);
+            project(w[3],att.data(),xb.data());add(x.data(),xb.data(),m.dim);
+            rmsnorm(xb.data(),x.data(),n[3],m.dim,m.eps);
+            project_batch(std::array<Matrix,2>{w[4],w[5]},xb.data(),
+                          std::array<float*,2>{gate.data(),up.data()});
+            for(uint32_t i=0;i<m.hidden;++i)gate[i]=silu(gate[i])*up[i];project(w[6],gate.data(),xb.data());add(x.data(),xb.data(),m.dim);
         }
-        if(calc){rmsnorm(x.data(),x.data(),reinterpret_cast<const float*>(m.final_norm),m.dim,m.eps);Matrix e{m.embed,m.vocab,m.dim,m.rs(m.dim)};matvec(m,e,x.data(),logits.data());}
+        if(calc){rmsnorm(x.data(),x.data(),reinterpret_cast<const float*>(m.final_norm),m.dim,m.eps);Matrix e{m.embed,m.vocab,m.dim,m.rs(m.dim)};project(e,x.data(),logits.data());}
     }
     uint32_t next()const{return uint32_t(std::max_element(logits.begin(),logits.end())-logits.begin());}
 };
 
-void run_turn(const Model& m,Engine& e,const std::string& text,uint32_t& pos,uint32_t maxgen){
+std::string run_turn(const Model& m,Engine& e,const std::string& text,uint32_t& pos,uint32_t maxgen,bool stream){
     auto toks=m.encode(text);std::vector<uint32_t> prompt{kImStart,kUser,kNl};prompt.insert(prompt.end(),toks.begin(),toks.end());prompt.insert(prompt.end(),{kImEnd,kNl,kImStart,kAssistant,kNl,kThinkStart,kNl2,kThinkEnd,kNl2});
     if(uint64_t(pos)+prompt.size()+maxgen+2>=e.maxseq){std::cerr<<"[chat] context full, resetting KV-cache\n";pos=0;}
     std::cerr<<"[chat] ctx="<<pos<<"/"<<e.maxseq<<"\n";
@@ -199,25 +256,61 @@ void run_turn(const Model& m,Engine& e,const std::string& text,uint32_t& pos,uin
     const auto prefill_end=std::chrono::steady_clock::now();
     const auto decode_start=prefill_end;
     uint32_t token=e.next(),made=0;
+    std::string output;
     while(made<maxgen&&token!=m.eos1&&token!=m.eos2&&pos<e.maxseq){
-        std::string s=m.token(token);std::cout<<s<<std::flush;++made;
+        std::string s=m.token(token);output+=s;if(stream)std::cout<<s<<std::flush;++made;
         if(made==maxgen||pos+1>=e.maxseq){e.forward(token,pos++,false);break;}
         e.forward(token,pos++,true);token=e.next();
     }
     const auto decode_end=std::chrono::steady_clock::now();
-    std::cout<<"\n"<<std::flush;
+    if(stream)std::cout<<"\n"<<std::flush;
     if(pos+2<e.maxseq){e.forward(m.eos1,pos++,false);e.forward(kNl,pos++,false);}
     std::cerr<<"[chat] ctx="<<pos<<"/"<<e.maxseq<<"\n";
     const double prefill_s=std::chrono::duration<double>(prefill_end-prefill_start).count();
     const double decode_s=std::chrono::duration<double>(decode_end-decode_start).count();
     std::cerr<<"[speed] prompt="<<prompt.size()<<" tokens, "<<(prefill_s?prompt.size()/prefill_s:0)<<" tok/s; generated="<<made<<" tokens, "<<(decode_s?made/decode_s:0)<<" tok/s\n";
+    return output;
+}
+
+void clear_context(Engine& e,uint32_t& pos){pos=0;std::fill(e.kc.begin(),e.kc.end(),0);std::fill(e.vc.begin(),e.vc.end(),0);}
+
+int run_stdio_worker(const Model& m,Engine& e,uint32_t maxgen){
+    uint32_t pos=0;std::string header;
+    while(std::getline(std::cin,header)){
+        if(header=="CLEAR"){
+            clear_context(e,pos);std::cout<<"OK 0\n\n"<<std::flush;continue;
+        }
+        if(header=="QUIT")break;
+        size_t size=0;
+        try{
+            size_t used=0;unsigned long long parsed=std::stoull(header,&used);
+            if(used!=header.size()||parsed>16384)throw std::runtime_error("invalid worker frame length");
+            size=size_t(parsed);
+        }catch(const std::exception& ex){std::string error=ex.what();std::cout<<"ERR "<<error.size()<<"\n"<<error<<"\n"<<std::flush;continue;}
+        std::string text(size,'\0');
+        if(size&&!std::cin.read(text.data(),std::streamsize(size)))break;
+        char separator=0;if(!std::cin.get(separator)||separator!='\n')break;
+        try{
+            std::string output=run_turn(m,e,text,pos,maxgen,false);
+            std::cout<<"OK "<<output.size()<<"\n";std::cout.write(output.data(),std::streamsize(output.size()));std::cout<<"\n"<<std::flush;
+        }catch(const std::exception& ex){
+            clear_context(e,pos);std::string error=ex.what();
+            std::cout<<"ERR "<<error.size()<<"\n";std::cout.write(error.data(),std::streamsize(error.size()));std::cout<<"\n"<<std::flush;
+        }
+    }
+    return 0;
 }
 }
 
 int main(int argc,char** argv){
-    try { if(argc<2){std::cerr<<"usage: asm-llm-arm64 MODEL.asmbin [context=2048] [max_tokens=128]\n";return 2;}
-        uint32_t ctx=argc>2?std::stoul(argv[2]):2048,gen=argc>3?std::stoul(argv[3]):128;
-        Model m(argv[1]); if(m.vocab!=kVocab)throw std::runtime_error("unexpected vocabulary size"); Engine e(m,ctx);std::cerr<<"asm-llm ARM64 native; Qwen3-0.6B ready ("<<m.file.size()<<" bytes)\nType /clear or /quit.\n";
-        uint32_t pos=0;std::string line;while(std::cout<<"asm-llm-arm64> "&&std::getline(std::cin,line)){if(line=="/quit"||line=="/halt")break;if(line=="/clear"||line=="/new"||line=="/reset"){pos=0;std::fill(e.kc.begin(),e.kc.end(),0);std::fill(e.vc.begin(),e.vc.end(),0);std::cout<<"history cleared\n";continue;}if(line.empty())continue;run_turn(m,e,line,pos,gen);}return 0;
+    try {
+        bool worker=argc>1&&std::string(argv[1])=="--stdio-worker";
+        if((worker&&argc<3)||(!worker&&argc<2)){std::cerr<<"usage: asm-llm-arm64 MODEL.asmbin [context=2048] [max_tokens=128]\n       asm-llm-arm64 --stdio-worker MODEL.asmbin [context=2048] [max_tokens=128]\n";return 2;}
+        const char* model_path=worker?argv[2]:argv[1];int offset=worker?1:0;
+        uint32_t ctx=argc>2+offset?std::stoul(argv[2+offset]):2048,gen=argc>3+offset?std::stoul(argv[3+offset]):128;
+        Model m(model_path); if(m.vocab!=kVocab)throw std::runtime_error("unexpected vocabulary size"); Engine e(m,ctx);
+        if(worker){std::cerr<<"asm-llm ARM64 worker ready ("<<m.file.size()<<" bytes)\n";std::cout<<"READY\n"<<std::flush;return run_stdio_worker(m,e,gen);}
+        std::cerr<<"asm-llm ARM64 native; Qwen3-0.6B ready ("<<m.file.size()<<" bytes)\nType /clear or /quit.\n";
+        uint32_t pos=0;std::string line;while(std::cout<<"asm-llm-arm64> "&&std::getline(std::cin,line)){if(line=="/quit"||line=="/halt")break;if(line=="/clear"||line=="/new"||line=="/reset"){clear_context(e,pos);std::cout<<"history cleared\n";continue;}if(line.empty())continue;run_turn(m,e,line,pos,gen,true);}return 0;
     } catch(const std::exception& ex){std::cerr<<"error: "<<ex.what()<<"\n";return 1;}
 }
