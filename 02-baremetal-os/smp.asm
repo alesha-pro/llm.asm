@@ -27,6 +27,9 @@ extern matmul_q8_0_range
 %if FAST_Q8
 extern quantize_x_q8_0
 extern gqa_attn_range
+%ifdef QWEN35
+extern deltanet_heads_range
+%endif
 %endif
 
 section .text
@@ -36,6 +39,9 @@ global tp_shutdown
 global tp_matmul_q8_0
 %if FAST_Q8
 global tp_gqa_attn
+%ifdef QWEN35
+global tp_deltanet
+%endif
 %endif
 global g_smp_total_cpus
 global g_smp_online_cpus
@@ -617,6 +623,10 @@ ap_entry64:
 %if FAST_Q8
     test    rcx, rcx
     jz      .run_attn
+%ifdef QWEN35
+    cmp     rcx, 1
+    je      .run_dn
+%endif
 %endif
     mov     r8,  r14                    ; r0
     mov     r9,  r15                    ; r1
@@ -627,6 +637,13 @@ ap_entry64:
     mov     rcx, r14                    ; h0
     mov     r8,  r15                    ; h1
     call    gqa_attn_range
+%ifdef QWEN35
+    jmp     .job_done
+.run_dn:                                ; K == 1: Gated-DeltaNet head job
+    mov     rdi, r14                    ; h0
+    mov     rsi, r15                    ; h1
+    call    deltanet_heads_range
+%endif
 %endif
 
 .job_done:
@@ -717,6 +734,10 @@ tp_matmul_q8_0:
 %if FAST_Q8
     test    rcx, rcx
     jz      .bsp_attn
+%ifdef QWEN35
+    cmp     rcx, 1
+    je      .bsp_dn
+%endif
 %endif
     xor     r8d, r8d                    ; r0 = 0
     mov     r9,  rax                    ; r1
@@ -727,6 +748,13 @@ tp_matmul_q8_0:
     xor     ecx, ecx                    ; h0 = 0
     mov     r8,  rax                    ; h1
     call    gqa_attn_range
+%ifdef QWEN35
+    jmp     .wait_workers
+.bsp_dn:
+    xor     edi, edi                    ; h0 = 0
+    mov     rsi, rax                    ; h1
+    call    deltanet_heads_range
+%endif
 %endif
 
 .wait_workers:
@@ -791,6 +819,30 @@ tp_gqa_attn:
     mov     r8, rcx                     ; h1 = n_heads
     xor     ecx, ecx                    ; h0 = 0
     jmp     gqa_attn_range
+%ifdef QWEN35
+
+; ----------------------------------------------------------------------------
+; void tp_deltanet(uint64 n_heads)   job kind tp_K = 1; params are in transformer.asm g_dn_job
+; ----------------------------------------------------------------------------
+tp_deltanet:
+    mov     rax, [rel tp_n_threads]
+    cmp     rax, 1
+    jle     .dn_single
+    push    rbx
+    push    r12
+    sub     rsp, 8
+    mov     rbx, rax
+    mov     [rel tp_M], rdi
+    mov     qword [rel tp_K], 1
+    mov     r12d, 1
+    lock xadd dword [rel tp_gen], r12d
+    inc     r12d
+    jmp     tp_matmul_q8_0.run_bsp_slice
+.dn_single:
+    mov     rsi, rdi                    ; h1 = n_heads
+    xor     edi, edi                    ; h0 = 0
+    jmp     deltanet_heads_range
+%endif
 %endif
 
 ; ============================================================================

@@ -174,10 +174,23 @@ tok_build_chat_prompt:
     jmp     .done
 
 .chat_mode:
+%ifdef QWEN35
+    ; Template ids come from g_ctx (header-driven; Qwen3 legacy ids when the header fields are 0)
+    lea     r15, [rel g_ctx]            ; raw_mode no longer needed
+%endif
     ; Prefix: <|im_start|> user \n  (3 tokens)
+%ifdef QWEN35
+    mov     edx, [r15 + CTX_TOK_IM_START]
+    mov     [r13 + 0], edx
+    mov     edx, [r15 + CTX_TOK_USER]
+    mov     [r13 + 4], edx
+    mov     edx, [r15 + CTX_TOK_NL]
+    mov     [r13 + 8], edx
+%else
     mov     dword [r13 + 0], TOK_IM_START
     mov     dword [r13 + 4], TOK_USER
     mov     dword [r13 + 8], TOK_NL
+%endif
 
     ; Encode user message into out_toks + 3
     mov     rdi, r12
@@ -188,21 +201,62 @@ tok_build_chat_prompt:
     lea     rcx, [rax + 3]              ; current count
 
     ; Suffix: <|im_end|> \n <|im_start|> assistant \n (5 tokens)
+%ifdef QWEN35
+    mov     edx, [r15 + CTX_TOK_IM_END]
+    mov     [r13 + rcx*4 + 0], edx
+    mov     edx, [r15 + CTX_TOK_NL]
+    mov     [r13 + rcx*4 + 4], edx
+    mov     edx, [r15 + CTX_TOK_IM_START]
+    mov     [r13 + rcx*4 + 8], edx
+    mov     edx, [r15 + CTX_TOK_ASSISTANT]
+    mov     [r13 + rcx*4 + 12], edx
+    mov     edx, [r15 + CTX_TOK_NL]
+    mov     [r13 + rcx*4 + 16], edx
+%else
     mov     dword [r13 + rcx*4 + 0],  TOK_IM_END
     mov     dword [r13 + rcx*4 + 4],  TOK_NL
     mov     dword [r13 + rcx*4 + 8],  TOK_IM_START
     mov     dword [r13 + rcx*4 + 12], TOK_ASSISTANT
     mov     dword [r13 + rcx*4 + 16], TOK_NL
+%endif
     add     rcx, 5
 
+%ifdef QWEN35
+    ; think_mode == 0: empty think block <think>\n\n</think>\n\n (4 tokens), both families.
+    ; think_mode == 1: Qwen3.5 appends "<think>\n" (2 tokens); Qwen3 appends nothing.
+%else
     ; If think_mode == 0, append empty think block: <think>\n\n</think>\n\n (4 tokens)
+%endif
     test    rbx, rbx
+%ifdef QWEN35
+    jnz     .think_on
+    mov     edx, [r15 + CTX_TOK_THINK_START]
+    mov     [r13 + rcx*4 + 0], edx
+    mov     edx, [r15 + CTX_TOK_NL2]
+    mov     [r13 + rcx*4 + 4], edx
+    mov     edx, [r15 + CTX_TOK_THINK_END]
+    mov     [r13 + rcx*4 + 8], edx
+    mov     edx, [r15 + CTX_TOK_NL2]
+    mov     [r13 + rcx*4 + 12], edx
+%else
     jnz     .ret_cnt
     mov     dword [r13 + rcx*4 + 0],  TOK_THINK_START
     mov     dword [r13 + rcx*4 + 4],  TOK_NL2
     mov     dword [r13 + rcx*4 + 8],  TOK_THINK_END
     mov     dword [r13 + rcx*4 + 12], TOK_NL2
+%endif
     add     rcx, 4
+%ifdef QWEN35
+    jmp     .ret_cnt
+.think_on:
+    cmp     qword [r15 + CTX_TPL_THINK_NL], 0
+    je      .ret_cnt
+    mov     edx, [r15 + CTX_TOK_THINK_START]
+    mov     [r13 + rcx*4 + 0], edx
+    mov     edx, [r15 + CTX_TOK_NL]
+    mov     [r13 + rcx*4 + 4], edx
+    add     rcx, 2
+%endif
 
 .ret_cnt:
     mov     rax, rcx

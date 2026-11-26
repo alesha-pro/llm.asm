@@ -100,6 +100,10 @@ kernel_main:
     mov     dword [rel opt_single_turn], 0
     mov     dword [rel opt_shutdown], 0
     mov     dword [rel opt_print_toks], 0
+%ifdef QWEN35
+    mov     dword [rel opt_taps], 0
+    mov     dword [rel opt_logits], 0
+%endif
     mov     qword [rel g_chat_pos], 0
     mov     dword [rel opt_temp], 0     ; 0.0f = greedy argmax
     mov     eax, 0x3F733333             ; 0.95f
@@ -172,6 +176,13 @@ kernel_main:
     call    model_init
     test    rax, rax
     js      .err_model
+%ifdef QWEN35
+    cmp     dword [rel opt_taps], 0
+    je      .no_taps
+    lea     rax, [rel tap_emit]
+    mov     [rel g_ctx + CTX_TAP_FN], rax
+.no_taps:
+%endif
 
     ; Capture boot-ready timestamp (from _start to model+SMP ready)
     call    timer_ns
@@ -412,6 +423,11 @@ kernel_main:
     jmp     .fatal
 .err_model:
     lea     rdi, [rel msg_err_model]
+%ifdef QWEN35
+    cmp     rax, -5
+    jne     .fatal
+    lea     rdi, [rel msg_err_layer_type]
+%endif
 .fatal:
     push    rdi
     mov     dil, VGA_ATTR_RED
@@ -588,12 +604,20 @@ run_inference:
     lea     rax, [r13 + 2]
     cmp     rax, [rbp + CTX_MAX_SEQ]
     jae     .save_chat_pos
+%ifdef QWEN35
+    mov     edi, [rbp + CTX_TOK_IM_END]
+%else
     mov     edi, TOK_IM_END
+%endif
     mov     rsi, r13
     xor     edx, edx
     call    transformer_forward
     inc     r13
+%ifdef QWEN35
+    mov     edi, [rbp + CTX_TOK_NL]
+%else
     mov     edi, TOK_NL
+%endif
     mov     rsi, r13
     xor     edx, edx
     call    transformer_forward
@@ -752,21 +776,122 @@ run_inference:
 ; uint64 pick_next_token(void) -> rax
 ; ----------------------------------------------------------------------------
 pick_next_token:
+%ifdef QWEN35
+    cmp     dword [rel opt_logits], 0
+    je      .no_dbg
+    call    dbg_logits
+.no_dbg:
+%endif
     lea     rax, [rel g_ctx]
     vmovss  xmm0, [rel opt_temp]
     vxorps  xmm1, xmm1, xmm1
     vucomiss xmm0, xmm1
     ja      .sample
     mov     rdi, [rax + CTX_BUF_LOGITS]
+%ifdef QWEN35
+    mov     rsi, [rax + CTX_SAMPLE_N]
+%else
     mov     rsi, [rax + CTX_VOCAB_SIZE]
+%endif
     jmp     argmax_f32
 .sample:
     mov     rdi, [rax + CTX_BUF_LOGITS]
     mov     rsi, [rax + CTX_BUF_PROBS]
+%ifdef QWEN35
+    mov     rdx, [rax + CTX_SAMPLE_N]
+%else
     mov     rdx, [rax + CTX_VOCAB_SIZE]
+%endif
     vmovss  xmm1, [rel opt_topp]
     lea     rcx, [rel opt_rng]
     jmp     sample_top_p
+
+%ifdef QWEN35
+; ----------------------------------------------------------------------------
+; void dbg_logits(void)   (cmdline logits=1) -- one line per sampled token:
+;   LG id:hex32 x5   = the top-5 logits (descending, first index wins ties) of CTX_BUF_LOGITS[0..CTX_SAMPLE_N)
+; hex32 = raw f32 bits. Pure debug; never taken unless logits=1.
+; ----------------------------------------------------------------------------
+dbg_logits:
+    push    rbp
+    mov     rbp, rsp
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    rdi
+    push    rsi
+    sub     rsp, 56
+    and     rsp, -16                    ; [rsp]=vals[5] f32, [rsp+32]=ids[5] u32
+    lea     rax, [rel g_ctx]
+    mov     r12, [rax + CTX_BUF_LOGITS]
+    mov     r13, [rax + CTX_SAMPLE_N]
+    mov     eax, 0xFF800000             ; -inf
+    xor     ebx, ebx
+.init:
+    mov     [rsp + rbx*4], eax
+    mov     dword [rsp + 32 + rbx*4], 0
+    inc     ebx
+    cmp     ebx, 5
+    jb      .init
+    xor     ebx, ebx
+.scan:
+    cmp     rbx, r13
+    jae     .print
+    vmovss  xmm0, [r12 + rbx*4]
+    vucomiss xmm0, [rsp + 16]
+    jbe     .next                       ; not > 5th best
+    mov     ecx, 4
+.shift:
+    test    ecx, ecx
+    jz      .put
+    vmovss  xmm1, [rsp + rcx*4 - 4]
+    vucomiss xmm0, xmm1
+    jbe     .put
+    vmovss  [rsp + rcx*4], xmm1
+    mov     eax, [rsp + 32 + rcx*4 - 4]
+    mov     [rsp + 32 + rcx*4], eax
+    dec     ecx
+    jmp     .shift
+.put:
+    vmovss  [rsp + rcx*4], xmm0
+    mov     [rsp + 32 + rcx*4], ebx
+.next:
+    inc     rbx
+    jmp     .scan
+.print:
+    mov     edi, 1
+    lea     rsi, [rel lg_pre]
+    call    write_cstr
+    xor     r14d, r14d
+.pr:
+    mov     edi, 1
+    lea     rsi, [rel lg_sp]
+    call    write_cstr
+    mov     edi, 1
+    mov     esi, [rsp + 32 + r14*4]
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel lg_col]
+    call    write_cstr
+    mov     edi, [rsp + r14*4]
+    call    write_hex64_raw
+    inc     r14d
+    cmp     r14d, 5
+    jb      .pr
+    mov     edi, 1
+    lea     rsi, [rel msg_nl]
+    call    write_cstr
+    lea     rsp, [rbp - 48]
+    pop     rsi
+    pop     rdi
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    pop     rbp
+    ret
+%endif
 
 ; ----------------------------------------------------------------------------
 ; void write_tok_csv(const uint32 *toks in rdi, uint64 count in rsi)
@@ -794,11 +919,135 @@ write_tok_csv:
     inc     rbx
     jmp     .lp
 .done:
+%ifdef QWEN35
     mov     edi, 1
     lea     rsi, [rel msg_nl]
     call    write_cstr
     pop     r13
     pop     r12
+    pop     rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; void tap_emit(int64 layer /*rdi: -1 embed, -2 final norm*/, u64 pos /*rsi*/, const float *vec /*rdx*/,
+;               u64 n /*rcx*/, u64 token /*r8*/)        (installed in g_ctx.tap_fn by taps=1)
+; One line per call:  TAP l=<E|F|n> p=<pos> t=<token> sum=<hex f64 bits> abs=<..> sq=<..> f8=<8 hex f32 bits, comma sep>
+; sum / sum|x| / sum x^2 accumulated in f64 in index order (same definition as the numpy reference).
+; ----------------------------------------------------------------------------
+tap_emit:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15                         ; 6 pushes + ret = 56 -> sub 40 gives 16B alignment
+    sub     rsp, 40
+    mov     r12, rdi
+    mov     r13, rsi
+    mov     r14, rdx
+    mov     r15, rcx
+    mov     rbp, r8
+    vxorpd  xmm4, xmm4, xmm4
+    vxorpd  xmm5, xmm5, xmm5
+    vxorpd  xmm6, xmm6, xmm6
+    xor     ebx, ebx
+.sum_lp:
+    cmp     rbx, r15
+    jae     .sum_done
+    vmovss  xmm0, [r14 + rbx*4]
+    vcvtss2sd xmm0, xmm0, xmm0
+    vaddsd  xmm4, xmm4, xmm0
+    vandpd  xmm1, xmm0, [rel d_absmask]
+    vaddsd  xmm5, xmm5, xmm1
+    vmulsd  xmm1, xmm0, xmm0
+    vaddsd  xmm6, xmm6, xmm1
+    inc     rbx
+    jmp     .sum_lp
+.sum_done:
+    vmovsd  [rsp + 0], xmm4
+    vmovsd  [rsp + 8], xmm5
+    vmovsd  [rsp + 16], xmm6
+
+    mov     edi, 1
+    lea     rsi, [rel tap_l]
+    call    write_cstr
+    cmp     r12, -1
+    jne     .not_e
+    lea     rsi, [rel tap_E]
+    jmp     .l_str
+.not_e:
+    cmp     r12, -2
+    jne     .l_num
+    lea     rsi, [rel tap_F]
+.l_str:
+    mov     edi, 1
+    call    write_cstr
+    jmp     .l_done
+.l_num:
+    mov     edi, 1
+    mov     rsi, r12
+    call    write_u64
+.l_done:
+    mov     edi, 1
+    lea     rsi, [rel tap_p]
+    call    write_cstr
+    mov     edi, 1
+    mov     rsi, r13
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel tap_t]
+    call    write_cstr
+%endif
+    mov     edi, 1
+%ifdef QWEN35
+    mov     rsi, rbp
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel tap_sum]
+    call    write_cstr
+    mov     rdi, [rsp + 0]
+    call    write_hex64_raw
+    mov     edi, 1
+    lea     rsi, [rel tap_abs]
+    call    write_cstr
+    mov     rdi, [rsp + 8]
+    call    write_hex64_raw
+    mov     edi, 1
+    lea     rsi, [rel tap_sq]
+    call    write_cstr
+    mov     rdi, [rsp + 16]
+    call    write_hex64_raw
+    mov     edi, 1
+    lea     rsi, [rel tap_f8]
+    call    write_cstr
+    xor     ebx, ebx
+.f8_lp:
+    test    rbx, rbx
+    jz      .f8_num
+    mov     edi, 1
+    lea     rsi, [rel msg_comma]
+    mov     edx, 1
+    call    sys_write_all
+.f8_num:
+    mov     edi, [r14 + rbx*4]
+    call    write_hex64_raw
+    inc     rbx
+    cmp     rbx, 8
+    jb      .f8_lp
+    mov     edi, 1
+%endif
+    lea     rsi, [rel msg_nl]
+    call    write_cstr
+%ifdef QWEN35
+    add     rsp, 40
+    pop     r15
+    pop     r14
+%endif
+    pop     r13
+    pop     r12
+%ifdef QWEN35
+    pop     rbp
+%endif
     pop     rbx
     ret
 
@@ -917,6 +1166,13 @@ print_boot_banner:
     call    vga_set_color
     mov     edi, 1
     lea     rsi, [rel ban_qwen]
+%ifdef QWEN35
+    lea     rax, [rel g_ctx]
+    cmp     qword [rax + CTX_TPL_THINK_NL], 0
+    je      .ban_q3
+    lea     rsi, [rel ban_qwen35]
+.ban_q3:
+%endif
     call    write_cstr
     mov     rax, [rel g_mod_size]
     add     rax, 524288
@@ -936,6 +1192,15 @@ print_boot_banner:
     call    write_cstr
     lea     rax, [rel g_ctx]
     mov     edi, 1
+%ifdef QWEN35
+    mov     rsi, [rax + CTX_N_LAYERS]
+    call    write_u64
+    mov     edi, 1
+    lea     rsi, [rel ban_mod_ctx2]
+    call    write_cstr
+    lea     rax, [rel g_ctx]
+    mov     edi, 1
+%endif
     mov     rsi, [rax + CTX_MAX_SEQ]
     call    write_u64
     mov     edi, 1
@@ -1035,7 +1300,11 @@ read_cpu_brand:
 ; Supports:
 ;   prompt="text with spaces" (or prompt='...' or prompt=singleword)
 ;   max_tokens=N, ctx=N, threads=N, think=0|1, raw=0|1, shutdown=0|1,
+%ifdef QWEN35
+;   print_tokens=0|1, taps=0|1, logits=0|1 (qwen35 only: top-5 logits per sampled token, see dbg_logits), temp=F, topp=F, seed=N
+%else
 ;   print_tokens=0|1, temp=F, topp=F, seed=N
+%endif
 ; ============================================================================
 parse_cmdline:
     push    rbx
@@ -1222,12 +1491,40 @@ parse_cmdline:
     lea     rsi, [rel key_print_tokens]
     call    str_eq
     test    eax, eax
+%ifdef QWEN35
+    jz      .chk_taps
+%else
     jz      .chk_temp
+%endif
     lea     rdi, [rel cmd_val_buf]
     call    parse_u64
     mov     [rel opt_print_toks], eax
     jmp     .tok_lp
 
+%ifdef QWEN35
+.chk_taps:
+    lea     rdi, [rel cmd_key_buf]
+    lea     rsi, [rel key_taps]
+    call    str_eq
+    test    eax, eax
+    jz      .chk_logits
+    lea     rdi, [rel cmd_val_buf]
+    call    parse_u64
+    mov     [rel opt_taps], eax
+    jmp     .tok_lp
+
+.chk_logits:
+    lea     rdi, [rel cmd_key_buf]
+    lea     rsi, [rel key_logits]
+    call    str_eq
+    test    eax, eax
+    jz      .chk_temp
+    lea     rdi, [rel cmd_val_buf]
+    call    parse_u64
+    mov     [rel opt_logits], eax
+    jmp     .tok_lp
+
+%endif
 .chk_temp:
     lea     rdi, [rel cmd_key_buf]
     lea     rsi, [rel key_temp]
@@ -1291,7 +1588,11 @@ d_1e6:          dq 1000000.0
 d_1e9:          dq 1000000000.0
 
 ban_line:       db "==============================================================================", 10, 0
+%ifdef QWEN35
+ban_title:      db "  asm-llm OS v2.0 | Bare-Metal Qwen3 / Qwen3.5 in 100% Pure x86-64 Assembly", 10, 0
+%else
 ban_title:      db "  asm-llm OS v2.0 | Bare-Metal Qwen3-0.6B in 100% Pure x86-64 Assembly", 10, 0
+%endif
 ban_cpu:        db "  CPU   : ", 0
 ban_avx_tsc:    db " (AVX2+FMA, ", 0
 ban_mhz_nl:     db " MHz)", 10, 0
@@ -1303,7 +1604,13 @@ ban_boot_lbl:   db " MiB | Boot: ", 0
 ban_model:      db "  Model : ", 0
 ban_qwen:       db "Qwen3-0.6B Q8_0 (", 0
 ban_mod_at:     db " MiB @ 0x", 0
+%ifdef QWEN35
+ban_qwen35:     db "Qwen3.5-2B Q8_0 (", 0
+ban_mod_ctx:    db ", ", 0
+ban_mod_ctx2:   db "L, ctx=", 0
+%else
 ban_mod_ctx:    db ", 28L, ctx=", 0
+%endif
 
 msg_prompt_lbl: db "Prompt: ", 0
 msg_repl_help:  db "Interactive Bare-Metal Chat (/clear, /think, /nothink, /bench, /halt, /help)", 10, 0
@@ -1353,6 +1660,24 @@ key_think:        db "think", 0
 key_raw:          db "raw", 0
 key_shutdown:     db "shutdown", 0
 key_print_tokens: db "print_tokens", 0
+%ifdef QWEN35
+key_taps:         db "taps", 0
+key_logits:       db "logits", 0
+lg_pre:  db 10, "LG", 0
+lg_sp:   db " ", 0
+lg_col:  db ":", 0
+tap_l:   db "TAP l=", 0
+tap_E:   db "E", 0
+tap_F:   db "F", 0
+tap_p:   db " p=", 0
+tap_t:   db " t=", 0
+tap_sum: db " sum=", 0
+tap_abs: db " abs=", 0
+tap_sq:  db " sq=", 0
+tap_f8:  db " f8=", 0
+align 16
+d_absmask: dq 0x7FFFFFFFFFFFFFFF, 0
+%endif
 key_temp:         db "temp", 0
 key_topp:         db "topp", 0
 key_seed:         db "seed", 0
@@ -1362,8 +1687,14 @@ msg_err_avx2:   db "[FATAL] CPU lacks AVX2+FMA+XSAVE (use QEMU -cpu host)", 10, 
 msg_err_mb:     db "[FATAL] Invalid Multiboot 1 magic", 10, 0
 msg_err_mod:    db "[FATAL] Missing .asmbin Multiboot module (pass -initrd model.asmbin)", 10, 0
 msg_err_magic:  db "[FATAL] Invalid .asmbin magic (expected ASML)", 10, 0
+%ifdef QWEN35
+msg_err_oom:    db "[FATAL] Not enough free physical RAM (use -m 2G, or -m 4G for the 2B model)", 10, 0
+msg_err_model:  db "[FATAL] model_init failed (arena OOM, or bad header / not .asmbin v3)", 10, 0
+msg_err_layer_type: db "[FATAL] .asmbin has a layer type / DeltaNet shape this kernel cannot run", 10, 0
+%else
 msg_err_oom:    db "[FATAL] Not enough free physical RAM (use -m 2G)", 10, 0
 msg_err_model:  db "[FATAL] model_init failed (arena OOM or bad header)", 10, 0
+%endif
 
 ; ============================================================================
 ; Kernel State (.bss)
@@ -1387,6 +1718,10 @@ opt_raw:          resd 1
 opt_single_turn:  resd 1
 opt_shutdown:     resd 1
 opt_print_toks:   resd 1
+%ifdef QWEN35
+opt_taps:         resd 1
+opt_logits:       resd 1
+%endif
 opt_has_prompt:   resd 1
 cur_show_ttft:    resd 1
 
