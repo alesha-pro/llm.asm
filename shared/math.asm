@@ -14,6 +14,12 @@
 ;   rmsnorm_avx2     : (float *out, const float *x, const float *w, uint64 n, float eps)
 ;   softmax_avx2     : (float *x, uint64 n)
 ;   silu_mul_avx2    : (float *gate_inout, const float *up, uint64 n)
+%ifdef QWEN35
+;   sigmoid_mul_avx2 : (float *dst_inout, const float *gate, uint64 n)   dst *= sigmoid(gate)
+;   scale_f32_avx2   : (float *x_inout, uint64 n, float alpha)
+;   conv4_step_avx2  : (float *x_inout, float *state, const float *w, uint64 n)  causal depthwise conv k=4, 3-row history
+;   deltanet_head_avx2: (S[128][128], q, k, v, o_out, delta_scratch, dec, beta) one Gated-DeltaNet head step
+%endif
 ;   vec_add_avx2     : (float *dst_inout, const float *src, uint64 n)
 ;   argmax_f32       : (const float *x, uint64 n) -> uint64
 ;   sample_top_p     : (float *logits, float *probs, uint64 vocab, float temp, float topp, uint64 *rng_state) -> uint64
@@ -37,6 +43,12 @@ global rmsnorm_avx2
 global softmax_avx2
 global silu_mul_avx2
 global vec_add_avx2
+%ifdef QWEN35
+global sigmoid_mul_avx2
+global scale_f32_avx2
+global conv4_step_avx2
+global deltanet_head_avx2
+%endif
 global argmax_f32
 global sample_top_p
 
@@ -551,6 +563,7 @@ silu_mul_avx2:
     vmulps  ymm1, ymm1, ymm6            ; x * num
     vdivps  ymm1, ymm1, ymm0            ; silu(x)
     vmulps  ymm1, ymm1, ymm7            ; silu(x) * up
+%ifdef QWEN35
     vmovups [r12 + rcx], ymm1
     add     rcx, 32
     jmp     .lp
@@ -558,6 +571,189 @@ silu_mul_avx2:
     pop     r13
     pop     r12
     pop     rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; void sigmoid_mul_avx2(float *dst_inout, const float *gate, uint64 n)
+; rdi = dst, rsi = gate, rdx = n (multiple of 8): dst[i] = dst[i] * sigmoid(gate[i])
+; Same branchless form as silu_mul: e = exp(-|g|); num = (g < 0) ? e : 1; out = dst*num/(1+e)
+; ----------------------------------------------------------------------------
+sigmoid_mul_avx2:
+    push    rbx
+    push    r12
+    push    r13
+    mov     r12, rdi
+    mov     r13, rsi
+    shl     rdx, 2
+    mov     rbx, rdx
+    vpbroadcastd ymm8, [rel i_abs_mask]
+    vpbroadcastd ymm9, [rel i_sign_mask]
+    vbroadcastss ymm10, [rel f_one]
+    xor     ecx, ecx
+.lp:
+    cmp     rcx, rbx
+    jae     .done
+    vmovups ymm6, [r13 + rcx]           ; g
+    vmovups ymm7, [r12 + rcx]           ; dst
+    vandps  ymm0, ymm6, ymm8
+    vxorps  ymm0, ymm0, ymm9            ; -|g|
+    call    fast_expf_avx2              ; e
+    vblendvps ymm1, ymm10, ymm0, ymm6   ; (g < 0) ? e : 1
+    vaddps  ymm0, ymm0, ymm10           ; 1 + e
+    vmulps  ymm1, ymm1, ymm7            ; dst * num
+    vdivps  ymm1, ymm1, ymm0
+%endif
+    vmovups [r12 + rcx], ymm1
+    add     rcx, 32
+    jmp     .lp
+.done:
+    pop     r13
+    pop     r12
+%ifdef QWEN35
+    pop     rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; void scale_f32_avx2(float *x, uint64 n, float alpha)   x[i] *= alpha
+; rdi = x, rsi = n (multiple of 8), xmm0 = alpha
+; ----------------------------------------------------------------------------
+scale_f32_avx2:
+    vbroadcastss ymm0, xmm0
+    shl     rsi, 2
+    xor     eax, eax
+.lp:
+    cmp     rax, rsi
+    jae     .done
+    vmulps  ymm1, ymm0, [rdi + rax]
+    vmovups [rdi + rax], ymm1
+    add     rax, 32
+    jmp     .lp
+.done:
+    ret
+
+; ----------------------------------------------------------------------------
+; void conv4_step_avx2(float *x, float *state, const float *w, uint64 n)
+; rdi = x [n] (pre-conv in, conv out, NO activation), rsi = state [3][n] (oldest row first),
+; rdx = w [4][n] tap-major (tap 3 hits the current x), rcx = n (multiple of 8).
+; y = ((h0*w0 + h1*w1) + h2*w2) + x*w3 (separate mul/add, as the numpy reference);
+; then state <- [h1, h2, x].
+; ----------------------------------------------------------------------------
+conv4_step_avx2:
+    mov     r8, rcx
+    shl     r8, 2                       ; row bytes
+    lea     r9, [rsi + r8]              ; state row 1
+    lea     r10, [r9 + r8]              ; state row 2
+    lea     r11, [rdx + r8]             ; w row 1
+    lea     rcx, [r11 + r8]             ; w row 2
+    push    rbx
+    lea     rbx, [rcx + r8]             ; w row 3
+    xor     eax, eax
+.lp:
+    cmp     rax, r8
+    jae     .done
+    vmovups ymm0, [rsi + rax]           ; h0
+    vmovups ymm1, [r9 + rax]            ; h1
+    vmovups ymm2, [r10 + rax]           ; h2
+    vmovups ymm3, [rdi + rax]           ; x
+    vmulps  ymm4, ymm0, [rdx + rax]
+    vmulps  ymm5, ymm1, [r11 + rax]
+    vaddps  ymm4, ymm4, ymm5
+    vmulps  ymm5, ymm2, [rcx + rax]
+    vaddps  ymm4, ymm4, ymm5
+    vmulps  ymm5, ymm3, [rbx + rax]
+    vaddps  ymm4, ymm4, ymm5
+    vmovups [rsi + rax], ymm1
+    vmovups [r9 + rax], ymm2
+    vmovups [r10 + rax], ymm3
+    vmovups [rdi + rax], ymm4
+    add     rax, 32
+    jmp     .lp
+.done:
+%endif
+    pop     rbx
+%ifdef QWEN35
+    ret
+
+; ----------------------------------------------------------------------------
+; void deltanet_head_avx2(float *S, const float *q, const float *k, const float *v,
+;                         float *o, float *delta, float dec(xmm0), float beta(xmm1))
+; rdi = S [128 key][128 value] f32 row-major, rsi = q (l2-normed, scaled), rdx = k (l2-normed),
+; rcx = v, r8 = o_out [128], r9 = scratch [128], xmm0 = exp(g), xmm1 = beta.
+; One Gated-DeltaNet step for one head (Dk = Dv = 128):
+;   kv    = S_old^T k ; S' = dec*S + k (x) delta ; delta = (v - dec*kv) * beta ; o = S'^T q
+; (decay is a scalar, so S_dec^T k == dec * S_old^T k: pass 1 only reads S.)
+; Two passes per 64-column half, 8 ymm accumulators. Clobbers ymm0-13, rax, r10, r11.
+; ----------------------------------------------------------------------------
+deltanet_head_avx2:
+    vbroadcastss ymm8, xmm0             ; dec
+    vbroadcastss ymm9, xmm1             ; beta
+    xor     eax, eax                    ; column-half byte offset (0, 256)
+.half:
+    vxorps  ymm0, ymm0, ymm0
+    vxorps  ymm1, ymm1, ymm1
+    vxorps  ymm2, ymm2, ymm2
+    vxorps  ymm3, ymm3, ymm3
+    vxorps  ymm4, ymm4, ymm4
+    vxorps  ymm5, ymm5, ymm5
+    vxorps  ymm6, ymm6, ymm6
+    vxorps  ymm7, ymm7, ymm7
+    lea     r11, [rdi + rax]
+    xor     r10d, r10d
+.p1:
+    vbroadcastss ymm10, [rdx + r10*4]
+%assign j 0
+%rep 8
+    vfmadd231ps ymm %+ j, ymm10, [r11 + 32*j]
+%assign j j+1
+%endrep
+    add     r11, 512
+    inc     r10d
+    cmp     r10d, 128
+    jb      .p1
+%assign j 0
+%rep 8
+    vmulps  ymm %+ j, ymm %+ j, ymm8            ; dec * kv
+    vmovups ymm13, [rcx + rax + 32*j]
+    vsubps  ymm13, ymm13, ymm %+ j              ; v - dec*kv
+    vmulps  ymm13, ymm13, ymm9                  ; * beta
+    vmovups [r9 + rax + 32*j], ymm13
+%assign j j+1
+%endrep
+    vxorps  ymm0, ymm0, ymm0
+    vxorps  ymm1, ymm1, ymm1
+    vxorps  ymm2, ymm2, ymm2
+    vxorps  ymm3, ymm3, ymm3
+    vxorps  ymm4, ymm4, ymm4
+    vxorps  ymm5, ymm5, ymm5
+    vxorps  ymm6, ymm6, ymm6
+    vxorps  ymm7, ymm7, ymm7
+    lea     r11, [rdi + rax]
+    xor     r10d, r10d
+.p2:
+    vbroadcastss ymm10, [rdx + r10*4]           ; k[i]
+    vbroadcastss ymm11, [rsi + r10*4]           ; q[i]
+%assign j 0
+%rep 8
+    vmovups ymm12, [r11 + 32*j]
+    vmulps  ymm12, ymm12, ymm8                  ; dec * S
+    vfmadd231ps ymm12, ymm10, [r9 + rax + 32*j] ; + k[i] * delta
+    vmovups [r11 + 32*j], ymm12
+    vfmadd231ps ymm %+ j, ymm11, ymm12          ; o += q[i] * S'[i]
+%assign j j+1
+%endrep
+    add     r11, 512
+    inc     r10d
+    cmp     r10d, 128
+    jb      .p2
+%assign j 0
+%rep 8
+    vmovups [r8 + rax + 32*j], ymm %+ j
+%assign j j+1
+%endrep
+    add     eax, 256
+    cmp     eax, 512
+    jb      .half
+%endif
     ret
 
 ; ----------------------------------------------------------------------------

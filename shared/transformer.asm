@@ -1,7 +1,20 @@
 ; ============================================================================
+%ifdef QWEN35
+; transformer.asm: Qwen3 / Qwen3.5 Transformer Forward Pass & Model Loader
+%else
 ; transformer.asm — Full Qwen3-0.6B Transformer Forward Pass & Model Loader
+%endif
 ;
+%ifdef QWEN35
+; Qwen3.5 (hybrid) additions, all selected by the .asmbin v3 header / per-layer descriptor:
+;   - layer type 1 = Gated DeltaNet (deltanet_layer), full-attn layers with output gate and partial RoPE
+;   - KV cache only for full-attention layers; DeltaNet S + conv state zeroed when pos == 0
+;   - optional per-layer debug taps (CTX_TAP_FN)
+;
+; Qwen3 architecture (all-full-attention path, unchanged math):
+%else
 ; Implements exact Qwen3 architecture:
+%endif
 ;   - Q8_0 tied embeddings + LM head
 ;   - 28 layers: RMSNorm -> Q/K/V (shared Q8_0 activation quant) -> per-head
 ;     QK-Norm -> split-half NeoX RoPE -> KV-cache -> GQA Attention (16Q/8KV)
@@ -34,6 +47,14 @@ extern rmsnorm_avx2
 extern softmax_avx2
 extern silu_mul_avx2
 extern vec_add_avx2
+%ifdef QWEN35
+extern sigmoid_mul_avx2
+extern scale_f32_avx2
+extern conv4_step_avx2
+extern deltanet_head_avx2
+extern exp_f64
+extern log_f64
+%endif
 
 extern matmul_set_fp16
 extern dequant_row_q8_0
@@ -41,6 +62,11 @@ extern dot_f32_avx2
 extern saxpy_f32_avx2
 
 extern tp_matmul_q8_0
+%ifdef QWEN35
+%ifdef BARE_METAL
+extern tp_deltanet
+%endif
+%endif
 %if FAST_Q8
 extern tp_gqa_attn
 %endif
@@ -51,6 +77,9 @@ global g_ctx
 global model_init
 global model_free
 global transformer_forward
+%ifdef QWEN35
+global deltanet_heads_range
+%endif
 %if FAST_Q8
 global gqa_attn_range
 %endif
@@ -61,6 +90,31 @@ global gqa_attn_range
     and     %1, -64
 %endmacro
 
+%ifdef QWEN35
+; Debug tap: if CTX_TAP_FN != 0 call it as tap(layer=%1 (-1 embed, -2 final norm), pos, buf_x, dim, token)
+%macro TAP_CALL 1
+    cmp     qword [rbx + CTX_TAP_FN], 0
+    je      %%skip
+    mov     rdi, %1
+    mov     rsi, [rsp + 0]
+    mov     rdx, [rbx + CTX_BUF_X]
+    mov     rcx, [rbx + CTX_DIM]
+    mov     r8,  [rsp + 128]
+    call    [rbx + CTX_TAP_FN]
+%%skip:
+%endmacro
+
+; ctx[%2] = header[%1] if non-zero else the legacy Qwen3 constant %3
+%macro LOAD_TOK 3
+    mov     eax, [r15 + %1]
+    test    eax, eax
+    jnz     %%ok
+    mov     eax, %3
+%%ok:
+    mov     [rbx + %2], rax
+%endmacro
+
+%endif
 ; ----------------------------------------------------------------------------
 ; Linux:      int64 model_init(const char *path, uint64 max_seq_override)
 ; Bare-Metal: int64 model_init(const void *base, uint64 size, uint64 max_seq_override)
@@ -111,22 +165,34 @@ model_init:
     js      .err_mmap
 %endif
 
+%ifdef QWEN35
+    ; Verify header magic and version (v3 only; fp16 vs fp32 scales from HDR_FLAGS)
+%else
     ; Verify header magic and version (v1 fp32 scales or v2 fp16 scales)
+%endif
     cmp     dword [r15 + HDR_MAGIC], ASMBIN_MAGIC
     jne     .err_bad_hdr
+%ifdef QWEN35
+    cmp     dword [r15 + HDR_VERSION], ASMBIN_VERSION_V3
+%else
     mov     eax, [r15 + HDR_VERSION]
     cmp     eax, ASMBIN_VERSION
     je      .ver_ok
     cmp     eax, ASMBIN_VERSION_V2
+%endif
     jne     .err_bad_hdr
+%ifndef QWEN35
 .ver_ok:
+%endif
     xor     ecx, ecx
     test    dword [r15 + HDR_FLAGS], HDR_FLAG_FP16_SCALES
     setnz   cl
+%ifndef QWEN35
     cmp     eax, ASMBIN_VERSION_V2
     jb      .store_scale_mode
     mov     ecx, 1
 .store_scale_mode:
+%endif
     mov     [rbx + CTX_FP16_SCALES], ecx
     mov     edx, 3
     add     edx, ecx                    ; 3 for fp32 (K>>3), 4 for fp16 (K>>4)
@@ -170,8 +236,10 @@ model_init:
 .use_hdr_seq:
     mov     [rbx + CTX_MAX_SEQ], rax
 
+%ifndef QWEN35
     mov     rax, [r15 + HDR_LAYER_STRIDE]
     mov     [rbx + CTX_LAYER_STRIDE], rax
+%endif
     mov     eax, [r15 + HDR_HT_MASK]
     mov     [rbx + CTX_HT_MASK], rax
     mov     eax, [r15 + HDR_EOS_1]
@@ -182,6 +250,52 @@ model_init:
     mov     [rbx + CTX_RMS_EPS], eax
     mov     eax, [r15 + HDR_ROPE_THETA]
     mov     [rbx + CTX_ROPE_THETA], eax
+%ifdef QWEN35
+
+    ; Qwen3.5 header extras (0 in Qwen3 files -> legacy defaults)
+    mov     eax, [r15 + HDR_ROT_DIM]
+    test    eax, eax
+    jnz     .rot_ok
+    mov     eax, [r15 + HDR_HEAD_DIM]
+.rot_ok:
+    mov     [rbx + CTX_ROT_DIM], rax
+    mov     eax, [r15 + HDR_FLAGS2]
+    mov     [rbx + CTX_FLAGS2], rax
+    xor     eax, eax
+    test    dword [r15 + HDR_FLAGS2], HDR_FLAG2_ATTN_OUT_GATE
+    jz      .no_gate_dim
+    mov     rax, [rbx + CTX_Q_DIM]
+.no_gate_dim:
+    mov     [rbx + CTX_GATE_DIM], rax
+    mov     eax, [r15 + HDR_N_LIN_V_HEADS]
+    mov     [rbx + CTX_LIN_HEADS], rax
+    mov     ecx, [r15 + HDR_LIN_V_DIM]
+    mov     [rbx + CTX_LIN_DIM], rcx
+    imul    rax, rcx
+    mov     [rbx + CTX_VAL_DIM], rax            ; Hv * Dv
+    mov     edx, [r15 + HDR_N_LIN_K_HEADS]
+    imul    edx, [r15 + HDR_LIN_K_DIM]          ; Hk * Dk
+    lea     rdx, [rax + rdx*2]
+    mov     [rbx + CTX_CONV_DIM], rdx           ; 2*Hk*Dk + Hv*Dv
+    mov     eax, [r15 + HDR_ARGMAX_LIMIT]
+    test    eax, eax
+    jnz     .samp_ok
+    mov     eax, [r15 + HDR_VOCAB_SIZE]
+.samp_ok:
+    mov     [rbx + CTX_SAMPLE_N], rax
+    xor     eax, eax
+    cmp     dword [r15 + HDR_TOK_IM_START], 0
+    setnz   al
+    mov     [rbx + CTX_TPL_THINK_NL], rax
+    LOAD_TOK HDR_TOK_IM_START,    CTX_TOK_IM_START,    TOK_IM_START
+    LOAD_TOK HDR_TOK_IM_END,      CTX_TOK_IM_END,      TOK_IM_END
+    LOAD_TOK HDR_TOK_THINK_START, CTX_TOK_THINK_START, TOK_THINK_START
+    LOAD_TOK HDR_TOK_THINK_END,   CTX_TOK_THINK_END,   TOK_THINK_END
+    LOAD_TOK HDR_TOK_USER,        CTX_TOK_USER,        TOK_USER
+    LOAD_TOK HDR_TOK_ASSISTANT,   CTX_TOK_ASSISTANT,   TOK_ASSISTANT
+    LOAD_TOK HDR_TOK_NL,          CTX_TOK_NL,          TOK_NL
+    LOAD_TOK HDR_TOK_NL2,         CTX_TOK_NL2,         TOK_NL2
+%endif
 
     ; Resolve pointers into mmap'd .asmbin
     mov     rax, [r15 + HDR_OFF_TOKENIZER]
@@ -202,13 +316,65 @@ model_init:
     mov     rax, [r15 + HDR_OFF_EMBED]
     add     rax, r15
     mov     [rbx + CTX_EMB_PTR], rax
+%ifdef QWEN35
+    mov     rax, [r15 + HDR_OFF_LAYER_TABLE]
+%else
     mov     rax, [r15 + HDR_OFF_LAYERS]
+%endif
     add     rax, r15
+%ifdef QWEN35
+    mov     [rbx + CTX_LAYER_TABLE], rax
+%else
     mov     [rbx + CTX_LAYERS_PTR], rax
+%endif
     mov     rax, [r15 + HDR_OFF_FINAL_NORM]
     add     rax, r15
     mov     [rbx + CTX_FINAL_NORM_PTR], rax
 
+%ifdef QWEN35
+    ; Count full-attention / DeltaNet layers; refuse unknown types and unsupported DeltaNet shapes
+    mov     rcx, [rbx + CTX_N_LAYERS]
+    mov     rdx, [rbx + CTX_LAYER_TABLE]
+    xor     r12d, r12d                  ; n_full
+    xor     r13d, r13d                  ; n_lin
+.type_chk_lp:
+    test    rcx, rcx
+    jz      .type_chk_done
+    mov     eax, [rdx + DESC_TYPE]
+    cmp     eax, LAYER_TYPE_FULL_ATTN
+    jne     .t_not_full
+    inc     r12
+    jmp     .t_next
+.t_not_full:
+    cmp     eax, LAYER_TYPE_LINEAR_ATTN
+    jne     .err_layer_type
+    inc     r13
+.t_next:
+    add     rdx, DESC_STRIDE
+    dec     rcx
+    jmp     .type_chk_lp
+.type_chk_done:
+    mov     [rbx + CTX_N_FULL], r12
+    mov     [rbx + CTX_N_LIN], r13
+    test    r13, r13
+    jz      .lin_cfg_ok
+    ; DeltaNet kernel assumptions: Hk == Hv <= 32, Dk == Dv == 128, conv kernel 4
+    mov     eax, [r15 + HDR_N_LIN_K_HEADS]
+    cmp     eax, [r15 + HDR_N_LIN_V_HEADS]
+    jne     .err_layer_type
+    cmp     eax, 32
+    ja      .err_layer_type
+    test    eax, eax
+    jz      .err_layer_type
+    cmp     dword [r15 + HDR_LIN_K_DIM], 128
+    jne     .err_layer_type
+    cmp     dword [r15 + HDR_LIN_V_DIM], 128
+    jne     .err_layer_type
+    cmp     dword [r15 + HDR_CONV_K], 4
+    jne     .err_layer_type
+.lin_cfg_ok:
+
+%endif
     ; Compute single anonymous mmap arena size for all activation buffers + KV cache
     ; First pass: compute exact aligned offsets (stored temporarily as relative offsets!)
     xor     rbp, rbp                    ; running offset = 0
@@ -224,17 +390,55 @@ model_init:
     ALLOC_BUF CTX_BUF_X, rax
     ALLOC_BUF CTX_BUF_XB, rax
 
+%ifdef QWEN35
+    ; One projection region, contiguous so each layer's projections run as ONE fused matmul:
+    ;   full attn: [q | k | v | gate]    DeltaNet: [qkv | z]   (sized for the larger)
+%else
     ; Place buf_q, buf_k, buf_v CONTIGUOUSLY so Q+K+V execute in ONE fused matmul!
+%endif
     mov     rax, [rbx + CTX_Q_DIM]
+%ifdef QWEN35
+    add     rax, [rbx + CTX_KV_DIM]
+    add     rax, [rbx + CTX_KV_DIM]
+    add     rax, [rbx + CTX_GATE_DIM]
+    mov     rcx, [rbx + CTX_CONV_DIM]
+    add     rcx, [rbx + CTX_VAL_DIM]
+    cmp     rax, rcx
+    jae     .proj_sz
+    mov     rax, rcx
+.proj_sz:
+    shl     rax, 2
+%else
     shl     rax, 2                      ; q_dim * 4
+%endif
     ALLOC_BUF CTX_BUF_Q, rax
+%ifdef QWEN35
+    mov     rax, [rbx + CTX_Q_DIM]
+    shl     rax, 2
+    add     rax, [rbx + CTX_BUF_Q]
+    mov     [rbx + CTX_BUF_K], rax      ; (still an arena-relative offset here)
+%endif
     mov     rax, [rbx + CTX_KV_DIM]
+%ifdef QWEN35
+    shl     rax, 2
+    add     rax, [rbx + CTX_BUF_K]
+    mov     [rbx + CTX_BUF_V], rax
+%else
     shl     rax, 2                      ; kv_dim * 4
     ALLOC_BUF CTX_BUF_K, rax
     ALLOC_BUF CTX_BUF_V, rax
+%endif
 
     mov     rax, [rbx + CTX_Q_DIM]
+%ifdef QWEN35
+    cmp     rax, [rbx + CTX_VAL_DIM]
+    jae     .att_out_sz
+    mov     rax, [rbx + CTX_VAL_DIM]
+.att_out_sz:
+    shl     rax, 2                      ; max(q_dim, Hv*Dv) * 4
+%else
     shl     rax, 2                      ; q_dim * 4
+%endif
     ALLOC_BUF CTX_BUF_ATT_OUT, rax
 
     mov     rax, [rbx + CTX_N_HEADS]
@@ -276,15 +480,44 @@ model_init:
     ALLOC_BUF CTX_BUF_PROMPT, MAX_PROMPT_TOKENS * 4
     ALLOC_BUF CTX_BUF_GEN,    MAX_GEN_TOKENS * 4
 
+%ifdef QWEN35
+    ; KV-cache (full-attention layers only): each is n_full * max_seq * kv_dim * 4 bytes
+    mov     rax, [rbx + CTX_N_FULL]
+%else
     ; KV-cache: each is n_layers * max_seq * kv_dim * 4 bytes
     mov     rax, [rbx + CTX_N_LAYERS]
+%endif
     imul    rax, [rbx + CTX_MAX_SEQ]
     imul    rax, [rbx + CTX_KV_DIM]
     shl     rax, 2
     ALLOC_BUF CTX_BUF_K_CACHE, rax
     ALLOC_BUF CTX_BUF_V_CACHE, rax
 
+%ifdef QWEN35
+    ; DeltaNet recurrent state S [n_lin][Hv][128][128] f32 + conv state [n_lin][3][conv_dim] f32,
+    ; adjacent so ONE memset at pos == 0 clears both
+    mov     rax, [rbx + CTX_LIN_HEADS]
+    shl     rax, 16                     ; Hv * 128*128*4
+    imul    rax, [rbx + CTX_N_LIN]
+    ALLOC_BUF CTX_BUF_DN_STATE, rax
+    mov     rax, [rbx + CTX_CONV_DIM]
+    imul    rax, [rbx + CTX_N_LIN]
+    imul    rax, 12                     ; 3 rows * 4 B
+    ALLOC_BUF CTX_BUF_DN_CONV, rax
+%endif
     ALIGN64 rbp
+%ifdef QWEN35
+    mov     rax, rbp
+    sub     rax, [rbx + CTX_BUF_DN_STATE]
+    mov     [rbx + CTX_DN_ZERO_BYTES], rax
+    mov     eax, 1024
+    ALLOC_BUF CTX_BUF_MISC, rax
+    mov     rax, [rbx + CTX_CONV_DIM]
+    shl     rax, 2
+    ALLOC_BUF CTX_BUF_ONES, rax
+
+    ALIGN64 rbp
+%endif
     mov     [rbx + CTX_ARENA_SIZE], rbp
 
     ; Allocate arena via anonymous mmap
@@ -302,10 +535,34 @@ model_init:
     add     rcx, 8
     dec     edx
     jnz     .reloc_lp
+%ifdef QWEN35
+    lea     rcx, [rbx + CTX_BUF_DN_STATE]
+    mov     edx, CTX_N_RELOC2
+.reloc2_lp:
+    add     [rcx], rax
+    add     rcx, 8
+    dec     edx
+    jnz     .reloc2_lp
+%endif
 
+%ifdef QWEN35
+    ; ones[conv_dim] = 1.0f (silu(x) == silu_mul(x, ones))
+    cld
+    mov     rdi, [rbx + CTX_BUF_ONES]
+    mov     rcx, [rbx + CTX_CONV_DIM]
+    mov     eax, 0x3F800000
+    rep stosd
+
+    ; Precompute exact FP64 RoPE inverse frequencies (over the rotary dims only)
+%else
     ; Precompute exact FP64 RoPE inverse frequencies
+%endif
     mov     rdi, [rbx + CTX_BUF_INV_FREQ]
+%ifdef QWEN35
+    mov     rsi, [rbx + CTX_ROT_DIM]
+%else
     mov     rsi, [rbx + CTX_HEAD_DIM]
+%endif
     vmovss  xmm0, [rbx + CTX_ROPE_THETA]
     call    init_rope_freqs
 
@@ -324,6 +581,14 @@ model_init:
     call    sys_munmap
     mov     rax, -3
     jmp     .ret
+%ifdef QWEN35
+.err_layer_type:
+    mov     rdi, r15
+    mov     rsi, r14
+    call    sys_munmap
+    mov     rax, -5                     ; unsupported layer type (callers print a message)
+    jmp     .ret
+%endif
 %ifndef BARE_METAL
 .err_mmap:
     mov     rax, -2
@@ -377,12 +642,22 @@ transformer_forward:
     push    r13
     push    r14
     push    r15
+%ifdef QWEN35
+    ; 6 pushes (48) + 264 + 8 (ret) = 320 -> 16B aligned
+    sub     rsp, 264
+%else
     ; Reserve 128 bytes of stack locals (6 pushes=48 + 128 + 8(ret)=184 -> use 136 for 16B align!)
     sub     rsp, 136
+%endif
     ; Stack locals:
     ;   [rsp + 0]  = pos
     ;   [rsp + 8]  = compute_logits
     ;   [rsp + 16] = layer_idx l
+%ifdef QWEN35
+    ;   [rsp + 24] = full-attention layer ordinal (KV cache index)
+    ;   [rsp + 32] = DeltaNet layer ordinal (state index)
+    ;   [rsp + 40] = current layer type
+%else
     ;   [rsp + 24] = p_in_norm
     ;   [rsp + 32] = p_q_norm
     ;   [rsp + 40] = p_k_norm
@@ -394,14 +669,40 @@ transformer_forward:
     ;   [rsp + 88] = p_gate_proj
     ;   [rsp + 96] = p_up_proj
     ;   [rsp + 104]= p_down_proj
+%endif
     ;   [rsp + 112]= att_scale (float32)
     ;   [rsp + 116]= gqa_ratio (uint32)
+%ifdef QWEN35
+    ;   [rsp + 120]= layer_kv_base_bytes (full_ord * max_seq * kv_dim * 4)
+    ;   [rsp + 128]= token id (for taps)
+    ;   [rsp + SLOT(i)] = absolute pointer of descriptor slot i (0..11), see constants.inc DSLOT_*
+%define SLOT(i) (136 + 8*(i))
+%else
     ;   [rsp + 120]= layer_kv_base_bytes (l * max_seq * kv_dim * 4)
+%endif
 
     mov     [rsp + 0], rsi              ; pos
     mov     [rsp + 8], rdx              ; compute_logits
+%ifdef QWEN35
+    mov     [rsp + 128], rdi            ; token
+%endif
     lea     rbx, [rel g_ctx]
 
+%ifdef QWEN35
+    ; Start of a sequence: clear the DeltaNet state + conv history (covers /clear, ctx-full, bench)
+    test    rsi, rsi
+    jnz     .no_state_zero
+    mov     rcx, [rbx + CTX_DN_ZERO_BYTES]
+    shr     rcx, 3
+    jz      .no_state_zero
+    cld
+    mov     rdi, [rbx + CTX_BUF_DN_STATE]
+    xor     eax, eax
+    rep stosq
+    mov     rdi, [rsp + 128]
+.no_state_zero:
+
+%endif
     ; Precompute att_scale = 1.0f / sqrt(head_dim) and gqa_ratio = n_heads / n_kv_heads
     mov     rax, [rbx + CTX_HEAD_DIM]
     vcvtsi2ss xmm0, xmm0, rax
@@ -426,28 +727,61 @@ transformer_forward:
     mov     rsi, [rbx + CTX_BUF_X]
     mov     rdx, rax                    ; dim
     call    dequant_row_q8_0
+%ifdef QWEN35
+    TAP_CALL -1
+%endif
 
+%ifdef QWEN35
+    ; 2. Compute RoPE cos/sin tables ONCE for this position (reused by all layers!)
+%else
     ; 2. Compute RoPE cos/sin tables ONCE for this position (reused by all 28 layers!)
+%endif
     mov     rdi, [rbx + CTX_BUF_COS]
     mov     rsi, [rbx + CTX_BUF_SIN]
     mov     rdx, [rbx + CTX_BUF_INV_FREQ]
+%ifdef QWEN35
+    mov     rcx, [rbx + CTX_ROT_DIM]
+    shr     rcx, 1                      ; half_dim of the rotary part
+%else
     mov     rcx, [rbx + CTX_HEAD_DIM]
     shr     rcx, 1                      ; half_dim
+%endif
     mov     r8,  [rsp + 0]              ; pos
     call    compute_rope_cs
 
     ; 3. Transformer Layer Loop (l = 0 .. n_layers - 1)
     mov     qword [rsp + 16], 0
+%ifdef QWEN35
+    mov     qword [rsp + 24], 0
+    mov     qword [rsp + 32], 0
+%endif
 
 .layer_lp:
     mov     rax, [rsp + 16]
     cmp     rax, [rbx + CTX_N_LAYERS]
     jae     .layers_done
 
+%ifdef QWEN35
+    ; Load the layer's tensor pointers from its v3 descriptor (absolute = file base + offset)
+    imul    rax, rax, DESC_STRIDE
+    add     rax, [rbx + CTX_LAYER_TABLE]
+    mov     rdx, [rbx + CTX_MMAP_BASE]
+    mov     ecx, [rax + DESC_TYPE]
+    mov     [rsp + 40], rcx
+%assign i 0
+%rep N_DESC_SLOTS
+    mov     rcx, [rax + DESC_OFFS + 8*i]
+    add     rcx, rdx
+    mov     [rsp + SLOT(i)], rcx
+%assign i i+1
+%endrep
+%else
     ; Compute all 11 tensor pointers for layer l (matching export_weights.py layout)
     imul    rax, [rbx + CTX_LAYER_STRIDE]
     add     rax, [rbx + CTX_LAYERS_PTR]
+%endif
 
+%ifndef QWEN35
     mov     [rsp + 24], rax             ; in_norm
     mov     rcx, [rbx + CTX_DIM]
     shl     rcx, 2
@@ -509,21 +843,50 @@ transformer_forward:
     ALIGN64 rax
     mov     [rsp + 104], rax            ; down_proj [dim, hidden_dim]
 
+%endif
     ; --- 3a. Input RMSNorm: buf_xb = rmsnorm(buf_x, in_norm) ---
     mov     rdi, [rbx + CTX_BUF_XB]
     mov     rsi, [rbx + CTX_BUF_X]
+%ifdef QWEN35
+    mov     rdx, [rsp + SLOT(0)]
+%else
     mov     rdx, [rsp + 24]
+%endif
     mov     rcx, [rbx + CTX_DIM]
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
 
+%ifdef QWEN35
+    cmp     qword [rsp + 40], LAYER_TYPE_LINEAR_ATTN
+    jne     .full_attn
+    ; --- Gated DeltaNet mixer: BUF_XB (normed) -> BUF_XB (out_proj result) ---
+    lea     rdi, [rsp + SLOT(0)]
+    mov     rsi, [rsp + 32]
+    call    deltanet_layer
+    inc     qword [rsp + 32]
+    jmp     .attn_residual
+
+.full_attn:
+    ; --- 3b. Fused Q + K + V (+ output gate) projection in ONE parallel matmul ---
+    mov     rdi, [rsp + SLOT(2)]        ; W_proj rows [q | k | v | gate?]
+%else
     ; --- 3b. Fused Q + K + V projection in ONE parallel matmul (zero padding between q/k/v!) ---
     mov     rdi, [rsp + 56]             ; q_proj (contiguous with k_proj, v_proj)
+%endif
     mov     rsi, [rbx + CTX_BUF_XB]
+%ifdef QWEN35
+    mov     rdx, [rbx + CTX_BUF_Q]      ; buf_q (contiguous with buf_k, buf_v, gate)
+%else
     mov     rdx, [rbx + CTX_BUF_Q]      ; buf_q (contiguous with buf_k, buf_v)
+%endif
     mov     rcx, [rbx + CTX_Q_DIM]
     add     rcx, [rbx + CTX_KV_DIM]
+%ifdef QWEN35
+    add     rcx, [rbx + CTX_KV_DIM]
+    add     rcx, [rbx + CTX_GATE_DIM]   ; M = q_dim + 2*kv_dim (+ q_dim if output gate)
+%else
     add     rcx, [rbx + CTX_KV_DIM]     ; M = q_dim + 2*kv_dim (4096)
+%endif
     mov     r8,  [rbx + CTX_DIM]        ; K = dim (1024)
     call    tp_matmul_q8_0
 
@@ -535,7 +898,11 @@ transformer_forward:
 .qnorm_lp:
     mov     rdi, r12
     mov     rsi, r12
+%ifdef QWEN35
+    mov     rdx, [rsp + SLOT(6)]        ; q_norm
+%else
     mov     rdx, [rsp + 32]             ; q_norm
+%endif
     mov     rcx, [rbx + CTX_HEAD_DIM]
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
@@ -548,7 +915,11 @@ transformer_forward:
 .knorm_lp:
     mov     rdi, r12
     mov     rsi, r12
+%ifdef QWEN35
+    mov     rdx, [rsp + SLOT(7)]        ; k_norm
+%else
     mov     rdx, [rsp + 40]             ; k_norm
+%endif
     mov     rcx, [rbx + CTX_HEAD_DIM]
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
@@ -556,24 +927,47 @@ transformer_forward:
     dec     r13
     jnz     .knorm_lp
 
+%ifdef QWEN35
+    ; --- 3d. Split-half RoPE on the first rot_dim dims of every Q and K head ---
+%else
     ; --- 3d. Split-half RoPE on Q and K ---
+%endif
     mov     rdi, [rbx + CTX_BUF_Q]
+%ifndef QWEN35
     mov     rsi, [rbx + CTX_BUF_COS]
     mov     rdx, [rbx + CTX_BUF_SIN]
+%endif
     mov     rcx, [rbx + CTX_N_HEADS]
+%ifdef QWEN35
+    call    rope_heads
+%else
     mov     r8,  [rbx + CTX_HEAD_DIM]
     call    rope_apply_avx2
 
+%endif
     mov     rdi, [rbx + CTX_BUF_K]
+%ifndef QWEN35
     mov     rsi, [rbx + CTX_BUF_COS]
     mov     rdx, [rbx + CTX_BUF_SIN]
+%endif
     mov     rcx, [rbx + CTX_N_KV_HEADS]
+%ifdef QWEN35
+    call    rope_heads
+%else
     mov     r8,  [rbx + CTX_HEAD_DIM]
     call    rope_apply_avx2
+%endif
 
+%ifdef QWEN35
+    ; --- 3e. Store K, V at contiguous cache[full_ord, kv_h, pos, head_dim] ---
+    ; layer_kv_base_bytes = full_ord * max_seq * kv_dim * 4
+    mov     rax, [rsp + 24]             ; full-attention layer ordinal
+    inc     qword [rsp + 24]
+%else
     ; --- 3e. Store K, V at contiguous cache[l, kv_h, pos, head_dim] ---
     ; layer_kv_base_bytes = l * max_seq * kv_dim * 4
     mov     rax, [rsp + 16]             ; l
+%endif
     imul    rax, [rbx + CTX_MAX_SEQ]
     imul    rax, [rbx + CTX_KV_DIM]
     shl     rax, 2
@@ -753,14 +1147,33 @@ transformer_forward:
 %endif
 
 .att_done:
+%ifdef QWEN35
+    ; --- 3f'. Output gate (Qwen3.5): att_out *= sigmoid(gate), gate rows follow v in the proj region ---
+    cmp     qword [rbx + CTX_GATE_DIM], 0
+    je      .no_out_gate
+    mov     rdi, [rbx + CTX_BUF_ATT_OUT]
+    mov     rsi, [rbx + CTX_KV_DIM]
+    shl     rsi, 2
+    add     rsi, [rbx + CTX_BUF_V]
+    mov     rdx, [rbx + CTX_Q_DIM]
+    call    sigmoid_mul_avx2
+.no_out_gate:
+%endif
     ; --- 3g. Output projection + residual: buf_x += o_proj @ buf_att_out ---
+%ifdef QWEN35
+    mov     rdi, [rsp + SLOT(3)]        ; o_proj
+%else
     mov     rdi, [rsp + 80]             ; o_proj
+%endif
     mov     rsi, [rbx + CTX_BUF_ATT_OUT]
     mov     rdx, [rbx + CTX_BUF_XB]
     mov     rcx, [rbx + CTX_DIM]
     mov     r8,  [rbx + CTX_Q_DIM]
     call    tp_matmul_q8_0
 
+%ifdef QWEN35
+.attn_residual:
+%endif
     mov     rdi, [rbx + CTX_BUF_X]
     mov     rsi, [rbx + CTX_BUF_XB]
     mov     rdx, [rbx + CTX_DIM]
@@ -769,13 +1182,21 @@ transformer_forward:
     ; --- 3h. Post-attention RMSNorm + SwiGLU MLP + residual ---
     mov     rdi, [rbx + CTX_BUF_XB]
     mov     rsi, [rbx + CTX_BUF_X]
+%ifdef QWEN35
+    mov     rdx, [rsp + SLOT(1)]        ; post_norm
+%else
     mov     rdx, [rsp + 48]             ; post_norm
+%endif
     mov     rcx, [rbx + CTX_DIM]
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
 
     ; Fused gate_proj + up_proj in ONE parallel matmul (contiguous in weights & arena!)
+%ifdef QWEN35
+    mov     rdi, [rsp + SLOT(4)]        ; gate_proj (contiguous with up_proj)
+%else
     mov     rdi, [rsp + 88]             ; gate_proj (contiguous with up_proj)
+%endif
     mov     rsi, [rbx + CTX_BUF_XB]
     mov     rdx, [rbx + CTX_BUF_GATE]   ; buf_gate (contiguous with buf_up)
     mov     rcx, [rbx + CTX_HIDDEN_DIM]
@@ -790,7 +1211,11 @@ transformer_forward:
     call    silu_mul_avx2
 
     ; down_proj + residual
+%ifdef QWEN35
+    mov     rdi, [rsp + SLOT(5)]        ; down_proj
+%else
     mov     rdi, [rsp + 104]            ; down_proj
+%endif
     mov     rsi, [rbx + CTX_BUF_GATE]
     mov     rdx, [rbx + CTX_BUF_XB]
     mov     rcx, [rbx + CTX_DIM]
@@ -802,6 +1227,9 @@ transformer_forward:
     mov     rdx, [rbx + CTX_DIM]
     call    vec_add_avx2
 
+%ifdef QWEN35
+    TAP_CALL [rsp + 16]
+%endif
     inc     qword [rsp + 16]
     jmp     .layer_lp
 
@@ -816,6 +1244,9 @@ transformer_forward:
     mov     rcx, [rbx + CTX_DIM]
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
+%ifdef QWEN35
+    TAP_CALL -2
+%endif
 
     mov     rdi, [rbx + CTX_EMB_PTR]    ; tied embeddings!
     mov     rsi, [rbx + CTX_BUF_X]
@@ -825,7 +1256,189 @@ transformer_forward:
     call    tp_matmul_q8_0
 
 .done:
+%ifdef QWEN35
+    add     rsp, 264
+%else
     add     rsp, 136
+%endif
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+%ifdef QWEN35
+    pop     rbx
+    ret
+
+
+; ----------------------------------------------------------------------------
+; void rope_heads(float *vec /*rdi*/, uint64 n_heads /*rcx*/)
+; Split-half RoPE on the first rot_dim dims of each head (stride head_dim); cos/sin from g_ctx.
+; ----------------------------------------------------------------------------
+rope_heads:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15                         ; 5 pushes + ret = 48 -> 16B aligned
+    lea     rbx, [rel g_ctx]
+    mov     r12, rdi
+    mov     r13, rcx
+    mov     r14, [rbx + CTX_HEAD_DIM]
+    shl     r14, 2
+.lp:
+    test    r13, r13
+    jz      .done
+    mov     rdi, r12
+    mov     rsi, [rbx + CTX_BUF_COS]
+    mov     rdx, [rbx + CTX_BUF_SIN]
+    mov     ecx, 1
+    mov     r8,  [rbx + CTX_ROT_DIM]
+    call    rope_apply_avx2
+    add     r12, r14
+    dec     r13
+    jmp     .lp
+.done:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+%endif
+    pop     rbx
+    ret
+
+%ifdef QWEN35
+; ----------------------------------------------------------------------------
+; void l2norm128(float *x /*rdi*/):  x *= 1/sqrt(sum(x^2) + 1e-6)   (n = 128)
+; ----------------------------------------------------------------------------
+l2norm128:
+    push    rbx
+    mov     rbx, rdi
+    mov     rsi, rdi
+    mov     edx, 128
+    call    dot_f32_avx2                ; xmm0 = sum(x^2)
+    vaddss  xmm0, xmm0, [rel t_l2eps]
+    vsqrtss xmm0, xmm0, xmm0
+    vmovss  xmm1, [rel t_one]
+    vdivss  xmm0, xmm1, xmm0
+    mov     rdi, rbx
+    mov     esi, 128
+    call    scale_f32_avx2
+    pop     rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; void deltanet_layer(const u64 *slots /*rdi: 12 absolute descriptor-slot pointers*/, u64 lin_ord /*rsi*/)
+; Gated DeltaNet mixer, BSP only. In: BUF_XB = normed input. Out: BUF_XB = out_proj result
+; (residual not added). Slots: 2 W_proj[qkv|z] 3 W_out 6 conv_w 7 negExpA 8 dt_bias 9 gnorm_w 10 W_b 11 W_a.
+; ----------------------------------------------------------------------------
+deltanet_layer:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 56                     ; 6 pushes + 56 + ret = 112 -> 16B aligned
+    ; [rsp + 24] dec f32, [rsp + 28] beta f32, [rsp + 32] sp f64, [rsp + 40] qscale f32, [rsp + 48] row bytes
+    lea     rbx, [rel g_ctx]
+    mov     rbp, rdi
+    mov     r13, rsi                    ; lin_ord
+
+    ; q scale = (float)(1.0 / sqrt(Dk))   (f64 math, as in the numpy reference)
+    vcvtsi2sd xmm0, xmm0, qword [rbx + CTX_LIN_DIM]
+    vsqrtsd xmm0, xmm0, xmm0
+    vmovsd  xmm1, [rel d_one]
+    vdivsd  xmm1, xmm1, xmm0
+    vcvtsd2ss xmm1, xmm1, xmm1
+    vmovss  [rsp + 40], xmm1
+
+    ; [qkv | z] = W_proj @ xb  (one fused matmul)
+    mov     rdi, [rbp + 8*2]
+    mov     rsi, [rbx + CTX_BUF_XB]
+    mov     rdx, [rbx + CTX_BUF_Q]
+    mov     rcx, [rbx + CTX_CONV_DIM]
+    add     rcx, [rbx + CTX_VAL_DIM]
+    mov     r8,  [rbx + CTX_DIM]
+    call    tp_matmul_q8_0
+
+    ; a[h] = W_a[h] . xb, b[h] = W_b[h] . xb  (fp32 weights, fp32 dots) -> MISC[0..], MISC[128..]
+    mov     r14, [rbp + 8*11]           ; W_a row ptr
+    mov     r15, [rbp + 8*10]           ; W_b row ptr
+    mov     rax, [rbx + CTX_DIM]
+    shl     rax, 2
+    mov     [rsp + 48], rax             ; row bytes
+    xor     r12d, r12d
+.ab_lp:
+    cmp     r12, [rbx + CTX_LIN_HEADS]
+    jae     .ab_done
+    mov     rdi, r14
+    mov     rsi, [rbx + CTX_BUF_XB]
+    mov     rdx, [rbx + CTX_DIM]
+    call    dot_f32_avx2
+    mov     rax, [rbx + CTX_BUF_MISC]
+    vmovss  [rax + r12*4], xmm0
+    mov     rdi, r15
+    mov     rsi, [rbx + CTX_BUF_XB]
+    mov     rdx, [rbx + CTX_DIM]
+    call    dot_f32_avx2
+    mov     rax, [rbx + CTX_BUF_MISC]
+    vmovss  [rax + 128 + r12*4], xmm0
+    add     r14, [rsp + 48]
+    add     r15, [rsp + 48]
+    inc     r12
+    jmp     .ab_lp
+.ab_done:
+
+    ; causal depthwise conv (k=4) over the 6144 qkv channels, then SiLU
+    mov     rsi, [rbx + CTX_CONV_DIM]
+    imul    rsi, r13
+    imul    rsi, 12                     ; lin_ord * conv_dim * 3 rows * 4 B
+    add     rsi, [rbx + CTX_BUF_DN_CONV]
+    mov     rdi, [rbx + CTX_BUF_Q]
+    mov     rdx, [rbp + 8*6]
+    mov     rcx, [rbx + CTX_CONV_DIM]
+    call    conv4_step_avx2
+    mov     rdi, [rbx + CTX_BUF_Q]
+    mov     rsi, [rbx + CTX_BUF_ONES]
+    mov     rdx, [rbx + CTX_CONV_DIM]
+    call    silu_mul_avx2
+
+    ; heads are independent: l2norm, g/beta, recurrence, gated rmsnorm -> BUF_ATT_OUT (SMP job kind K=1)
+    lea     rax, [rel g_dn_job]
+    mov     [rax + 0], r13              ; lin_ord
+    mov     rcx, [rbp + 8*7]
+    mov     [rax + 8], rcx              ; negExpA
+    mov     rcx, [rbp + 8*8]
+    mov     [rax + 16], rcx             ; dt_bias
+    mov     rcx, [rbp + 8*9]
+    mov     [rax + 24], rcx             ; gnorm_w
+    mov     ecx, [rsp + 40]
+    mov     [rax + 32], ecx             ; q scale
+    mov     rdi, [rbx + CTX_LIN_HEADS]
+%ifdef BARE_METAL
+    call    tp_deltanet
+%else
+    mov     rsi, rdi
+    xor     edi, edi
+    call    deltanet_heads_range
+%endif
+    mov     r14, [rbx + CTX_CONV_DIM]
+    shl     r14, 2
+    add     r14, [rbx + CTX_BUF_Q]      ; z region
+    mov     rdi, r14
+    mov     rsi, [rbx + CTX_BUF_ATT_OUT]
+    mov     rdx, [rbx + CTX_VAL_DIM]
+    call    silu_mul_avx2               ; z = silu(z) * on
+
+    mov     rdi, [rbp + 8*3]            ; out_proj
+    mov     rsi, r14
+    mov     rdx, [rbx + CTX_BUF_XB]
+    mov     rcx, [rbx + CTX_DIM]
+    mov     r8,  [rbx + CTX_VAL_DIM]
+    call    tp_matmul_q8_0
+
+    add     rsp, 56
     pop     r15
     pop     r14
     pop     r13
@@ -834,6 +1447,115 @@ transformer_forward:
     pop     rbx
     ret
 
+
+; ----------------------------------------------------------------------------
+; void deltanet_heads_range(uint64 h0 /*rdi*/, uint64 h1 /*rsi*/)   (thread-safe, heads are independent)
+; Per head h in [h0,h1): l2norm q,k ; g, beta ; state recurrence ; gated-norm rmsnorm -> BUF_ATT_OUT[h*128].
+; Job parameters from g_dn_job (written by deltanet_layer), the rest from g_ctx.
+; ----------------------------------------------------------------------------
+deltanet_heads_range:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    sub     rsp, 584                    ; 6 pushes + 584 + ret = 640 -> 16B aligned
+    ; [rsp + 0] dec f32, [rsp + 4] beta f32, [rsp + 64..575] delta scratch
+    lea     rbx, [rel g_ctx]
+    lea     rbp, [rel g_dn_job]
+    mov     r12, rdi                    ; h
+    mov     [rsp + 8], rsi              ; h1
+    mov     r13, [rbp + 0]              ; lin_ord
+.hd_lp:
+    cmp     r12, [rsp + 8]
+    jae     .hd_done
+    mov     r14, r12
+    shl     r14, 9                      ; h * 128 * 4
+    add     r14, [rbx + CTX_BUF_Q]      ; q_h
+    mov     r15, [rbx + CTX_VAL_DIM]    ; key_dim == value_dim
+    shl     r15, 2
+    add     r15, r14                    ; k_h
+    mov     rdi, r14
+    call    l2norm128
+    mov     rdi, r14
+    mov     esi, 128
+    vmovss  xmm0, [rbp + 32]
+    call    scale_f32_avx2
+    mov     rdi, r15
+    call    l2norm128
+
+    ; sp = a + dt_bias ; softplus = sp > 20 ? sp : log(1 + exp(sp))  (f64)
+    mov     rax, [rbx + CTX_BUF_MISC]
+    vmovss  xmm0, [rax + r12*4]
+    vcvtss2sd xmm0, xmm0, xmm0
+    mov     rax, [rbp + 16]
+    vmovss  xmm1, [rax + r12*4]
+    vcvtss2sd xmm1, xmm1, xmm1
+    vaddsd  xmm0, xmm0, xmm1
+    vucomisd xmm0, [rel d_twenty]
+    ja      .sp_done                    ; softplus(sp) = sp
+    call    exp_f64
+    vaddsd  xmm0, xmm0, [rel d_one]
+    call    log_f64
+.sp_done:
+    mov     rax, [rbp + 8]
+    vmovss  xmm1, [rax + r12*4]
+    vcvtss2sd xmm1, xmm1, xmm1          ; negExpA[h] = -exp(A_log)
+    vmulsd  xmm0, xmm0, xmm1            ; g
+    call    exp_f64
+    vcvtsd2ss xmm0, xmm0, xmm0
+    vmovss  [rsp + 0], xmm0             ; dec = exp(g)
+    mov     rax, [rbx + CTX_BUF_MISC]
+    vmovss  xmm0, [rax + 128 + r12*4]
+    vcvtss2sd xmm0, xmm0, xmm0
+    vxorpd  xmm0, xmm0, [rel d_signmask]
+    call    exp_f64                     ; exp(-b)
+    vaddsd  xmm0, xmm0, [rel d_one]
+    vmovsd  xmm1, [rel d_one]
+    vdivsd  xmm1, xmm1, xmm0
+    vcvtsd2ss xmm1, xmm1, xmm1
+    vmovss  [rsp + 4], xmm1             ; beta = sigmoid(b)
+
+    mov     rdi, r13
+    imul    rdi, [rbx + CTX_LIN_HEADS]
+    add     rdi, r12
+    shl     rdi, 16                     ; (lin_ord*H + h) * 64 KiB
+    add     rdi, [rbx + CTX_BUF_DN_STATE]
+    mov     rsi, r14                    ; q
+    mov     rdx, r15                    ; k
+    mov     rcx, [rbx + CTX_VAL_DIM]
+    shl     rcx, 2
+    add     rcx, r15                    ; v_h
+    mov     r8, r12
+    shl     r8, 9
+    add     r8, [rbx + CTX_BUF_ATT_OUT]
+    mov     r14, r8                     ; o_h
+    lea     r9, [rsp + 64]
+    vmovss  xmm0, [rsp + 0]
+    vmovss  xmm1, [rsp + 4]
+    call    deltanet_head_avx2
+
+    ; gated norm part 1: o_h = rmsnorm(o_h) * w  (the silu(z) factor is applied after the join)
+    mov     rdi, r14
+    mov     rsi, r14
+    mov     rdx, [rbp + 24]
+    mov     ecx, 128
+    vmovss  xmm0, [rbx + CTX_RMS_EPS]
+    call    rmsnorm_avx2
+    inc     r12
+    jmp     .hd_lp
+.hd_done:
+    add     rsp, 584
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+
+%endif
 %if FAST_Q8
 ; ----------------------------------------------------------------------------
 ; void gqa_attn_range(uint64 layer_kv_base, uint64 pos, uint64 scale_gqa_packed,
@@ -977,9 +1699,23 @@ gqa_attn_range:
 %endif
 
 section .rodata
+%ifdef QWEN35
+align 16
+t_one:      dd 1.0
+t_l2eps:    dd 1.0e-6
+align 16
+d_one:      dq 1.0
+d_twenty:   dq 20.0
+d_signmask: dq 0x8000000000000000, 0
+%else
 align 4
 t_one: dd 1.0
+%endif
 
 section .bss
 alignb 64
 g_ctx: resb CTX_SIZE
+%ifdef QWEN35
+alignb 64
+g_dn_job: resq 8                  ; deltanet_layer -> deltanet_heads_range job parameters
+%endif

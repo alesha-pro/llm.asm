@@ -110,6 +110,8 @@ make os-iso MODEL=models/qwen3-0.6b-q8_0.asmbin
 
 Full QEMU KVM, bootable ISO, and 0 GB disk Proxmox VE deployment guide: **[02-baremetal-os/README.md](02-baremetal-os/README.md)**.
 
+Qwen3.5-2B (hybrid Gated DeltaNet) runs on a second, separately built kernel (`make os-qwen35`, `.asmbin` v3); the default kernel and the v1/v2 loader are unchanged. See the [Qwen3.5-2B section](02-baremetal-os/README.md#qwen35-2b).
+
 ### 3. Train Mini-GPT from Scratch in 32 KB (`03-minigpt-train/`)
 
 Zero Python required to train or run inference:

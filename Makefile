@@ -5,6 +5,16 @@ OBJCOPY := objcopy
 LDFLAGS := --gc-sections -s -z noexecstack -z noseparate-code
 BUILD   := build
 
+# MODEL_ARCH selects the bare-metal kernel: qwen3 (default, .asmbin v1/v2, Qwen3-0.6B) or
+# qwen35 (-DQWEN35=1, .asmbin v3, Qwen3.5-2B: DeltaNet + gated attention). `make os-qwen35` builds the latter.
+MODEL_ARCH ?= qwen3
+ifeq ($(MODEL_ARCH),qwen35)
+OS_SUFFIX := -qwen35
+MODEL     ?= models/qwen35-2b-q8_0-v3.asmbin
+# the ~2 GB module needs a 4G guest
+RAM       ?= 4G
+endif
+
 # Portable defaults (override on CLI, e.g. make inference FAST_Q8=0)
 FAST_Q8 ?= 1
 MODEL   ?= models/qwen3-0.6b-q8_0.asmbin
@@ -43,11 +53,14 @@ TEST_OBJS := \
 
 # --- Phase 2: Bare-Metal Bootable LLM OS (22 KB Multiboot 1 kernel) ---
 P2_DIR     := 02-baremetal-os
-OS_BUILD   := $(BUILD)/os
+OS_BUILD   := $(BUILD)/os$(OS_SUFFIX)
 OS_ELF64   := $(OS_BUILD)/asm-llm-os.elf64
-OS_ELF     := $(BUILD)/asm-llm-os.elf
-OS_ISO     := $(BUILD)/asm-llm-os.iso
+OS_ELF     := $(BUILD)/asm-llm-os$(OS_SUFFIX).elf
+OS_ISO     := $(BUILD)/asm-llm-os$(OS_SUFFIX).iso
 OS_AFLAGS  := -f elf64 -DBARE_METAL -DFAST_Q8=$(FAST_Q8) -I$(SHARED_DIR)/ -I$(P2_DIR)/
+ifeq ($(MODEL_ARCH),qwen35)
+OS_AFLAGS  += -DQWEN35=1
+endif
 OS_LDFLAGS := -m elf_x86_64 -T $(P2_DIR)/linker.ld --gc-sections -s -z max-page-size=0x1000 -z noexecstack
 
 OS_OBJS := \
@@ -76,7 +89,7 @@ TRAIN_OBJS := \
 	$(TRAIN_BUILD)/tui.o \
 	$(TRAIN_BUILD)/main.o
 
-.PHONY: all inference test-math check os os-check os-iso os-run train train-check check-all clean
+.PHONY: all inference test-math check os os-qwen35 os-check os-iso os-iso-dual os-run train train-check check-all clean
 
 all: inference $(TEST) os train
 
@@ -139,6 +152,9 @@ $(OS_ELF): $(OS_ELF64)
 
 os: $(OS_ELF)
 
+os-qwen35:
+	$(MAKE) os MODEL_ARCH=qwen35
+
 os-check: $(OS_ELF)
 	ls -la $(OS_ELF)
 	file $(OS_ELF)
@@ -149,6 +165,13 @@ os-check: $(OS_ELF)
 
 os-iso: $(OS_ELF)
 	bash scripts/mkiso.sh "$(OS_ELF)" "$(MODEL)" "$(OS_ISO)" '$(CMDLINE)'
+
+# One ISO with a GRUB menu: Qwen3-0.6B (default kernel) and Qwen3.5-2B (qwen35 kernel); needs a 4G+ VM
+MODEL2  ?= models/qwen35-2b-q8_0-v3.asmbin
+os-iso-dual:
+	$(MAKE) os
+	$(MAKE) os-qwen35
+	KERNEL2=$(BUILD)/asm-llm-os-qwen35.elf MODEL2=$(MODEL2) bash scripts/mkiso.sh $(BUILD)/asm-llm-os.elf models/qwen3-0.6b-q8_0.asmbin $(BUILD)/asm-llm-os-dual.iso '$(CMDLINE)'
 
 os-run: $(OS_ELF)
 	qemu-system-x86_64 -enable-kvm -cpu host -m $(RAM) -smp $(SMP) \

@@ -1,0 +1,111 @@
+{
+ "model": "Qwen/Qwen3.5-2B",
+ "dtype": "float32 (bf16 weights upcast)",
+ "param_dtypes_after_load": [
+  "torch.bfloat16"
+ ],
+ "param_dtypes_used": [
+  "torch.float32"
+ ],
+ "params_reloaded_exact_f32": 320,
+ "params_that_differed_after_bf16_load": 18,
+ "lm_head_tied_to_embed": true,
+ "transformers": "5.9.0",
+ "prompt_text": "<|im_start|>user\nSay hi in 5 words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "prompt_token_ids": [
+  248045,
+  846,
+  198,
+  44240,
+  15131,
+  303,
+  220,
+  20,
+  4105,
+  13,
+  248046,
+  198,
+  248045,
+  74455,
+  198,
+  248068,
+  271,
+  248069,
+  271
+ ],
+ "generated_token_ids": [
+  9419,
+  1017,
+  0,
+  248046,
+  198,
+  248044,
+  248045,
+  846,
+  198,
+  44240,
+  15131,
+  303,
+  220,
+  20,
+  4105,
+  13
+ ],
+ "generated_text_all16": "Hello there!<|im_end|>\n<|endoftext|><|im_start|>user\nSay hi in 5 words.",
+ "first_eos_index_in_generated": 3,
+ "generated_text_until_eos": "Hello there!",
+ "note": "16 tokens forced (EOS not obeyed); tokens after first_eos_index are post-EOS continuation.",
+ "first_position_top5": [
+  {
+   "id": 9419,
+   "token": "Hello",
+   "logit": 22.443132400512695
+  },
+  {
+   "id": 88621,
+   "token": "Greetings",
+   "logit": 19.31987953186035
+  },
+  {
+   "id": 12675,
+   "token": "Hi",
+   "logit": 19.2775821685791
+  },
+  {
+   "id": 4199,
+   "token": "How",
+   "logit": 18.88579750061035
+  },
+  {
+   "id": 14773,
+   "token": "Good",
+   "logit": 18.875286102294922
+  }
+ ],
+ "first_position_logits_stats": {
+  "max": 22.443132400512695,
+  "min": -9.475236892700195,
+  "mean": -1.1959071159362793,
+  "n_vocab_logits": 248320
+ },
+ "per_step_top1_logit": [
+  22.443132400512695,
+  17.90947914123535,
+  19.881269454956055,
+  20.63790512084961,
+  29.40454864501953,
+  25.290573120117188,
+  23.035728454589844,
+  21.126985549926758,
+  24.428081512451172,
+  17.208515167236328,
+  19.362525939941406,
+  21.742759704589844,
+  22.338151931762695,
+  24.184627532958984,
+  21.778112411499023,
+  22.028499603271484
+ ],
+ "sanity_nocache_argmax_chain_equals_cached": true,
+ "sanity_first_pos_logit_maxabsdiff_prefill_vs_nocache": 4.3392181396484375e-05
+}

@@ -176,6 +176,8 @@ Pass via QEMU `-append "..."`, `make os-run CMDLINE='...'`, or `make os-iso CMDL
 | `seed=N` | `42` | PRNG seed |
 | `print_tokens=0\|1` | `0` | Print `PROMPT_TOKENS:` and `GEN_TOKENS:` markers |
 | `shutdown=0\|1` | `0` | Power off via ACPI after batch prompt completes |
+| `taps=0\|1` | `0` | qwen35 kernel only: print one `TAP` line (f64 sum, sum of abs, sum of squares, first 8 values) per layer and position, for comparison with a reference via `scripts/diff_taps.py` |
+| `logits=0\|1` | `0` | qwen35 kernel only: print the top-5 logits (`LG id:f32bits`) of every sampled token |
 
 ---
 
@@ -192,6 +194,45 @@ Phase 2 compiles the exact same `shared/math.asm`, `shared/matmul.asm`, `shared/
   - **PS/2 Keyboard (`0x60`/`0x64`):** scancode set 1 to ASCII (Shift, Backspace, Enter).
   - **PIT Channel 2 + RDTSC:** 20 ms hardware PIT calibration for accurate nanosecond boot/prefill/decode profiling.
   - **ACPI Poweroff:** QEMU/Bochs ACPI S5 ports (`0x604`, `0xB004`, `0x4004`) plus `isa-debug-exit` fallback.
+
+---
+
+## Qwen3.5-2B
+
+Qwen3.5-2B is a hybrid model: 18 Gated DeltaNet layers (linear attention with a recurrent state and a short causal convolution) and 6 full-attention layers with an output gate and partial RoPE, tied embeddings, 248k vocabulary. It runs on a second kernel that is selected at build time, like `FAST_Q8`: `make os-qwen35` (equivalent to `make os MODEL_ARCH=qwen35`) assembles the shared sources with `-DQWEN35=1` and writes `build/asm-llm-os-qwen35.elf` (28,680 bytes). The default build is unchanged: it produces the same 24,252-byte kernel as before, byte for byte, and reads `.asmbin` v1/v2. The qwen35 kernel reads only `.asmbin` v3 (layout in [scripts/ASMBIN_V3.md](../scripts/ASMBIN_V3.md)) and rejects other versions.
+
+```bash
+# Export (Qwen3.5 is detected from config.json and written as v3, about 2.0 GB)
+python3 scripts/export_weights.py --model-dir models/qwen3.5-2b-bf16 --out models/qwen35-2b-q8_0-v3.asmbin
+
+make os-qwen35
+qemu-system-x86_64 -enable-kvm -cpu host -m 4G -smp 8 \
+  -kernel build/asm-llm-os-qwen35.elf \
+  -initrd models/qwen35-2b-q8_0-v3.asmbin \
+  -nographic
+
+# Makefile shortcuts (RAM defaults to 4G with MODEL_ARCH=qwen35)
+make os-run MODEL_ARCH=qwen35 SMP=8 CMDLINE='prompt="Say hi in 5 words." print_tokens=1 shutdown=1'
+make os-iso MODEL_ARCH=qwen35 MODEL=models/qwen35-2b-q8_0-v3.asmbin
+make os-iso-dual     # one ISO with a GRUB menu entry for each kernel/model pair
+python3 scripts/verify_qwen35.py --smp 1,4,8,16
+```
+
+The module is about 2 GB, so the guest needs `-m 4G`. The chat template is the same as for Qwen3 (`think=0` appends `<think>\n\n</think>\n\n` to the assistant turn, `think=1` appends `<think>\n`); there is no system prompt.
+
+Checks:
+- `scripts/verify_qwen35.py` boots the kernel on a fixed prompt and compares the prompt token ids and the generated ids with the Hugging Face float32 reference stored in `scripts/qwen35/golden_2b.json`. `scripts/qwen35/ref_numpy.py` is a small numpy implementation of the same model used to cross-check the layer math. Prompt `Say hi in 5 words.` gives the 19 reference prompt ids and `Hello there!` (ids 9419, 1017, 0) at 1, 4, 8 and 16 vCPUs.
+- Greedy tokens are identical across vCPU counts on the prompts tried.
+- Against the Hugging Face float32 reference, three longer prompts (Italian, code with indentation, a 150-token paragraph; 32 generated tokens each) follow the reference until one position each (tokens 21, 31 and 5), where the reference's two best candidates were 0.004, 0.076 and 0.033 logit apart; the text stays coherent. On the code prompt the logit difference to the reference is about 0.085 rms, the same size as for an independent numpy int8 emulation of this kernel (0.079), so the flips look like W8A8 rounding noise. This was analysed in depth on that one prompt only.
+
+Measured on QEMU KVM (AMD Ryzen AI 9 HX 370 host): decode about 30 to 34 tok/s at 8 vCPUs (32 to 64 generated tokens) and about 19 tok/s at 1 vCPU; prefill about 37 tok/s (it runs token by token).
+
+Limits:
+- The tokenizer has no regex pre-tokenizer, so text is merged as one BPE stream. On 83 test prompts (21 run through the kernel, the rest through a replica of its merge algorithm) 29% tokenized differently from the Hugging Face tokenizer; the differences were whitespace runs, indentation and word-boundary re-segmentation, and prose prompts matched. Code and indented text are the likely trouble spots.
+- Needs 4 GiB of guest RAM.
+- Prefill is not batched.
+- Tested at positions up to about 190. Sampling with `temp` > 0 was not tested for this model.
+- `FAST_Q8=1` (the default) is the configuration that was tested.
 
 ---
 
