@@ -236,6 +236,23 @@ _start:
     jmp     .arg_lp
 
 .args_done:
+    ; Kernels need D, head_dim and FF on a 16-float boundary, and H dividing D
+    mov     rax, [rbp + TRN_DIM]
+    test    al, 15
+    jnz     .err_shape
+    mov     rcx, [rbp + TRN_HEADS]
+    test    rcx, rcx
+    jz      .err_shape
+    xor     edx, edx
+    div     rcx
+    test    rdx, rdx
+    jnz     .err_shape
+    test    al, 15
+    jnz     .err_shape
+    mov     rax, [rbp + TRN_HIDDEN]
+    test    al, 15
+    jnz     .err_shape
+
     ; Set RNG seed (must be non-zero for xorshift64*)
     mov     rax, [rel opt_seed]
     test    rax, rax
@@ -719,6 +736,13 @@ _start:
     lea     rsi, [rel msg_err_oom]
     call    write_cstr
     mov     edi, 6
+    call    sys_exit_group
+
+.err_shape:
+    mov     edi, 2
+    lea     rsi, [rel msg_err_shape]
+    call    write_cstr
+    mov     edi, 7
     call    sys_exit_group
 
 ; ============================================================================
@@ -1857,6 +1881,7 @@ msg_err_data:      db "error: failed to load dataset", 10, 0
 msg_err_ckpt:      db "error: failed to load checkpoint", 10, 0
 msg_err_save:      db "error: failed to save checkpoint", 10, 0
 msg_err_oom:       db "error: mmap arena allocation failed", 10, 0
+msg_err_shape:     db "error: --dim, --hidden and head_dim must be multiples of 16, and --heads must divide --dim", 10, 0
 
 msg_usage:
     db "asm-gpt-train (100% pure x86-64 AVX2/FMA Mini-GPT trainer & sampler, zero libc)", 10
