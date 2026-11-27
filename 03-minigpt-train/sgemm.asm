@@ -326,6 +326,117 @@ transpose_worker:
     mov     r15, r11
     shl     r15, 2                      ; src_row_bytes = cols * 4
 
+    ; Fast 8x8 AVX2 in-register SIMD transpose for full 8-row strips
+    mov     rdi, r11
+    and     rdi, -8                     ; cols_8 = cols & ~7
+    lea     rsi, [r15 + r15*2]          ; 3 * src_row_bytes
+
+align 16
+.r8_lp:
+    lea     rax, [r12 + 8]
+    cmp     rax, r13
+    ja      .r_lp                       ; < 8 rows left -> scalar tail
+
+    mov     rax, r12
+    imul    rax, r15
+    lea     rbx, [r8 + rax]             ; src_p = &src[r, 0]
+    lea     rbp, [r9 + r12*4]           ; dst_p = &dst[0, r]
+
+    xor     ecx, ecx                    ; c = 0
+    test    rdi, rdi
+    jz      .c8_tail
+
+align 16
+.c8_lp:
+    ; Load 8x8 tile: rows r..r+7, cols c..c+7
+    lea     rax, [rbx + rcx*4]          ; row 0
+    vmovups ymm0, [rax]
+    vmovups ymm1, [rax + r15]
+    vmovups ymm2, [rax + r15*2]
+    vmovups ymm3, [rax + rsi]
+    lea     rax, [rax + r15*4]          ; row 4
+    vmovups ymm4, [rax]
+    vmovups ymm5, [rax + r15]
+    vmovups ymm6, [rax + r15*2]
+    vmovups ymm7, [rax + rsi]
+
+    ; Stage 1: interleave 32-bit pairs
+    vunpcklps ymm8,  ymm0, ymm1
+    vunpckhps ymm9,  ymm0, ymm1
+    vunpcklps ymm10, ymm2, ymm3
+    vunpckhps ymm11, ymm2, ymm3
+    vunpcklps ymm12, ymm4, ymm5
+    vunpckhps ymm13, ymm4, ymm5
+    vunpcklps ymm14, ymm6, ymm7
+    vunpckhps ymm15, ymm6, ymm7
+
+    ; Stage 2: combine 64-bit halves within 128-bit lanes
+    vshufps ymm0, ymm8,  ymm10, 0x44
+    vshufps ymm1, ymm8,  ymm10, 0xEE
+    vshufps ymm2, ymm9,  ymm11, 0x44
+    vshufps ymm3, ymm9,  ymm11, 0xEE
+    vshufps ymm4, ymm12, ymm14, 0x44
+    vshufps ymm5, ymm12, ymm14, 0xEE
+    vshufps ymm6, ymm13, ymm15, 0x44
+    vshufps ymm7, ymm13, ymm15, 0xEE
+
+    ; Stage 3: cross-lane 128-bit permute -> 8 transposed rows of 8 floats
+    vperm2f128 ymm8,  ymm0, ymm4, 0x20
+    vperm2f128 ymm9,  ymm1, ymm5, 0x20
+    vperm2f128 ymm10, ymm2, ymm6, 0x20
+    vperm2f128 ymm11, ymm3, ymm7, 0x20
+    vperm2f128 ymm12, ymm0, ymm4, 0x31
+    vperm2f128 ymm13, ymm1, ymm5, 0x31
+    vperm2f128 ymm14, ymm2, ymm6, 0x31
+    vperm2f128 ymm15, ymm3, ymm7, 0x31
+
+    ; Store 8 contiguous 32B rows to dst[c..c+7, r..r+7]
+    lea     rdx, [r14 + r14*2]          ; 3 * dst_row_bytes
+    vmovups [rbp],         ymm8
+    vmovups [rbp + r14],   ymm9
+    vmovups [rbp + r14*2], ymm10
+    vmovups [rbp + rdx],   ymm11
+    lea     rbp, [rbp + r14*4]
+    vmovups [rbp],         ymm12
+    vmovups [rbp + r14],   ymm13
+    vmovups [rbp + r14*2], ymm14
+    vmovups [rbp + rdx],   ymm15
+    lea     rbp, [rbp + r14*4]
+
+    add     rcx, 8
+    cmp     rcx, rdi
+    jb      .c8_lp
+
+.c8_tail:
+    ; Scalar tail for remaining cols [cols_8 .. cols) across rows r..r+7
+    cmp     rcx, r11
+    jae     .r8_next
+    lea     rax, [rbx + rcx*4]
+    mov     edx, [rax]
+    mov     [rbp + 0], edx
+    mov     edx, [rax + r15]
+    mov     [rbp + 4], edx
+    mov     edx, [rax + r15*2]
+    mov     [rbp + 8], edx
+    mov     edx, [rax + rsi]
+    mov     [rbp + 12], edx
+    lea     rax, [rax + r15*4]
+    mov     edx, [rax]
+    mov     [rbp + 16], edx
+    mov     edx, [rax + r15]
+    mov     [rbp + 20], edx
+    mov     edx, [rax + r15*2]
+    mov     [rbp + 24], edx
+    mov     edx, [rax + rsi]
+    mov     [rbp + 28], edx
+    add     rbp, r14
+    inc     rcx
+    jmp     .c8_tail
+
+.r8_next:
+    add     r12, 8
+    jmp     .r8_lp
+
 .r_lp:
     cmp     r12, r13
     jae     .done
@@ -349,6 +460,7 @@ transpose_worker:
     inc     r12
     jmp     .r_lp
 .done:
+    vzeroupper
     pop     r15
     pop     r14
     pop     r13
