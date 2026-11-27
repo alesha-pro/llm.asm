@@ -113,7 +113,7 @@ There is no dynamic section in this file.
 | `-m <path>` | *(required)* | Path to `.asmbin` weight file |
 | `-p <text>` | built-in | User prompt (UTF-8) |
 | `-n <int>` | `128` | Maximum generated tokens |
-| `-t <int>` | `32` | Worker thread count (`clone()` + `futex()` pool) |
+| `-t <int>` | `32` | Worker thread count (`clone()` + `futex()` pool). The default does not adapt to the CPU: on a machine with fewer than 32 hardware threads, pass `-t` explicitly, at or below `nproc` (lower while other CPU-heavy jobs run). Oversubscribed runs have been reported to slow down by more than 20x (#9, #10) |
 | `-c <int>` | `2048` | KV-cache context length |
 | `--chat` | off | Interactive multi-turn chat via raw Linux `read(0)`/`write(1)` syscalls; preserves KV-cache across turns, supports `/clear` (`/new`, `/reset`), `/think`, `/nothink`, `/quit` (`/exit`, Ctrl-D), and prints `ctx=X/2048` |
 | `--think` | off | Enable Qwen3 `<think>...</think>` reasoning mode |
