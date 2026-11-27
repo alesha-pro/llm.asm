@@ -2,7 +2,7 @@
 
 A complete Transformer training and autoregressive inference engine written in **100% pure x86-64 NASM assembly**. **Zero Python, zero C, zero libc, zero libm, and zero runtime dependencies** are needed to train a language model from scratch and generate text from it.
 
-- **32,752 bytes (`32.0 KiB`)** stripped static Linux x86-64 ELF (`.text` = 27,954 B, `.rodata` = 4,173 B, `.bss` = 173,568 B `NOBITS`, zero dynamic libraries).
+- **32,944 bytes (`32.2 KiB`)** stripped static Linux x86-64 ELF (`.text` = 28,114 B, `.rodata` = 4,205 B, `.bss` = 173,568 B `NOBITS`, zero dynamic libraries).
 - **Modern Llama/GPT FP32 architecture:** auto-discovered character vocabulary, pre-norm RMSNorm, split-half RoPE (FP64-precomputed cos/sin tables), Causal Multi-Head Self-Attention, SwiGLU MLP, untied `tok_emb` and `lm_head`, and numerically stable Cross-Entropy Loss.
 - **Hand-written `6x16` AVX2+FMA FP32 SGEMM:** 12 YMM accumulators, zero stack traffic in the inner `k`-loop, supporting `NN`, `TN`, and `NT` layouts with disjoint tile parallelism over our zero-libc `clone()` + `futex()` thread pool (**bit-exact** across `1T..24T`).
 - **Full analytical backward pass + decoupled AdamW:** verified per-tensor against PyTorch CPU across all **21 parameter tensors** (`worst max_abs_diff = 3.35e-8`, `min cosine_sim = 1.0000000000`), global L2 gradient clipping, linear warmup + cosine LR decay, and `.gptckpt` binary checkpoints.
@@ -47,7 +47,7 @@ make train-check
 Expected ELF inspection output:
 
 ```text
--rwxr-xr-x 1 user user 32752 build/asm-gpt-train
+-rwxr-xr-x 1 user user 32944 build/asm-gpt-train
 build/asm-gpt-train: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
 There is no dynamic section in this file.
 ```
