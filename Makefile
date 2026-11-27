@@ -53,6 +53,7 @@ OS_LDFLAGS := -m elf_x86_64 -T $(P2_DIR)/linker.ld --gc-sections -s -z max-page-
 OS_OBJS := \
 	$(OS_BUILD)/boot.o \
 	$(OS_BUILD)/drivers.o \
+	$(OS_BUILD)/fbcon.o \
 	$(OS_BUILD)/runtime.o \
 	$(OS_BUILD)/smp.o \
 	$(OS_BUILD)/kernel.o \
@@ -118,6 +119,8 @@ $(OS_BUILD):
 
 $(OS_BUILD)/%.o: $(P2_DIR)/%.asm $(P2_DIR)/os_constants.inc $(SHARED_DIR)/constants.inc $(FAST_Q8_STAMP) | $(OS_BUILD)
 	$(NASM) $(OS_AFLAGS) $< -o $@
+
+$(OS_BUILD)/fbcon.o: $(P2_DIR)/font8x8.inc
 
 $(OS_BUILD)/math.o: $(SHARED_DIR)/math.asm | $(OS_BUILD)
 	$(NASM) $(OS_AFLAGS) $< -o $@

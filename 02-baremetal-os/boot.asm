@@ -19,6 +19,7 @@ extern _bss_end
 extern kernel_main
 extern serial_putc
 extern console_write_cstr
+extern g_vga_base
 extern write_hex64_raw
 
 global _start
@@ -39,6 +40,9 @@ section .multiboot align=4
     dd MB_HEADER_MAGIC
     dd MB_HEADER_FLAGS
     dd MB_HEADER_CHECKSUM
+    dd 0, 0, 0, 0, 0            ; address fields (unused: flags bit 16 clear, ELF used)
+    dd MB_VIDEO_EGA_TEXT        ; mode_type: EGA text on BIOS, GOP framebuffer on UEFI
+    dd VGA_COLS, VGA_ROWS, 0    ; width, height, depth
 
 ; ============================================================================
 ; 32-bit Protected Mode Bootstrap
@@ -62,6 +66,9 @@ _start:
     shr     ecx, 2
     xor     eax, eax
     rep     stosd
+
+    ; Console text cells start at VGA text memory; fb_init may swap in a shadow
+    mov     dword [g_vga_base], VGA_MEM
 
     ; Set up temporary 32-bit stack at top of BSP stack
     mov     esp, bsp_stack_top

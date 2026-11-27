@@ -33,8 +33,12 @@ global timer_ns
 global qemu_shutdown
 global g_tsc_hz
 global g_tsc_mhz
+global g_vga_base
 
 extern g_boot_tsc
+extern fb_draw_cell
+extern fb_redraw
+extern g_fb_on
 
 ; ============================================================================
 ; 1. COM1 Serial Driver (0x3F8, 115200 8N1)
@@ -115,11 +119,12 @@ vga_clear:
     mov     edx, eax
     shl     eax, 16
     or      eax, edx                    ; 2 cells in eax
-    mov     rdi, VGA_MEM
+    mov     rdi, [rel g_vga_base]
     mov     ecx, (VGA_COLS * VGA_ROWS) / 2
     rep     stosd
-    call    vga_update_cursor
-    ret
+    cmp     byte [rel g_fb_on], 0
+    je      vga_update_cursor
+    jmp     fb_redraw
 
 ; void vga_set_color(uint8 attr in dil)
 vga_set_color:
@@ -128,6 +133,8 @@ vga_set_color:
 
 ; Internal: update hardware VGA cursor via CRTC 0x3D4/0x3D5
 vga_update_cursor:
+    cmp     byte [rel g_fb_on], 0
+    jne     .ret
     mov     eax, [rel vga_row]
     imul    eax, eax, VGA_COLS
     add     eax, [rel vga_col]
@@ -146,6 +153,7 @@ vga_update_cursor:
     mov     dx, VGA_CRTC_DATA
     mov     al, ch
     out     dx, al
+.ret:
     ret
 
 ; Internal: scroll VGA screen up by 1 line
@@ -153,8 +161,8 @@ vga_scroll:
     push    rdi
     push    rsi
     push    rcx
-    mov     rdi, VGA_MEM
-    mov     rsi, VGA_MEM + (VGA_COLS * 2)
+    mov     rdi, [rel g_vga_base]
+    lea     rsi, [rdi + VGA_COLS * 2]
     mov     ecx, ((VGA_ROWS - 1) * VGA_COLS) / 2
     rep     movsd
 
@@ -168,6 +176,10 @@ vga_scroll:
     mov     ecx, VGA_COLS / 2
     rep     stosd
     mov     dword [rel vga_row], VGA_ROWS - 1
+    cmp     byte [rel g_fb_on], 0
+    je      .no_fb
+    call    fb_redraw
+.no_fb:
     pop     rcx
     pop     rsi
     pop     rdi
@@ -194,8 +206,9 @@ vga_emit_ascii:
     imul    ecx, ecx, VGA_COLS
     add     ecx, [rel vga_col]
     mov     ah, [rel vga_attr]
-    mov     rdx, VGA_MEM
+    mov     rdx, [rel g_vga_base]
     mov     [rdx + rcx*2], ax
+    call    vga_cell_touched
 
     mov     eax, [rel vga_col]
     inc     eax
@@ -223,8 +236,9 @@ vga_emit_ascii:
     add     ecx, eax
     mov     ah, [rel vga_attr]
     mov     al, ' '
-    mov     rdx, VGA_MEM
+    mov     rdx, [rel g_vga_base]
     mov     [rdx + rcx*2], ax
+    call    vga_cell_touched
     ret
 
 .tab:
@@ -246,6 +260,14 @@ vga_emit_ascii:
     ret
 .store_row:
     mov     [rel vga_row], eax
+.ret:
+    ret
+
+; Internal: redraw cell ecx on the framebuffer console (no-op in VGA text mode)
+vga_cell_touched:
+    cmp     byte [rel g_fb_on], 0
+    je      .ret
+    call    fb_draw_cell
 .ret:
     ret
 
@@ -756,6 +778,7 @@ section .bss
 alignb 8
 g_tsc_hz:       resq 1
 g_tsc_mhz:      resq 1
+g_vga_base:     resq 1                  ; VGA_MEM (set in boot.asm) or fbcon shadow
 vga_row:        resd 1
 vga_col:        resd 1
 utf8_cp:        resd 1

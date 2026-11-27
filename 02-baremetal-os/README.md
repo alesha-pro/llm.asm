@@ -2,7 +2,7 @@
 
 A standalone bootable x86-64 operating system that runs **Qwen/Qwen3-0.6B** directly on hardware or KVM with **no Linux, no Windows, no C, no Rust, and no libc**.
 
-- **24,252 bytes** stripped static Multiboot 1 kernel (`FAST_Q8=1`, default: `.text` = 17,143 B, `.rodata` = 2,772 B, `.bss` = 2.1 MiB `NOBITS`, zero dynamic dependencies), or **23,612 bytes** (`FAST_Q8=0`, legacy Q8_0xFP32).
+- **26,012 bytes** stripped static Multiboot 1 kernel (`FAST_Q8=1`, default: `.text` = 18,103 B, `.rodata` = 3,572 B, `.bss` = 2.1 MiB `NOBITS`, zero dynamic dependencies), or **25,372 bytes** (`FAST_Q8=0`, legacy Q8_0xFP32).
 - **74–94 ms cold boot** to interactive `asm-llm>` multi-turn chat with persistent KV-cache across turns, all SMP cores online, and the `.asmbin` v2 (`614 MiB` FP16 scales) or v1 (`649 MiB` FP32 scales) model bound zero-copy from physical RAM on 2 MiB huge pages.
 - **100% token-exact and byte-for-byte parity** with [Phase 1](../01-qwen3-inference/) across `1..32` vCPUs.
 - **134.9 tok/s** decode on QEMU KVM (AMD EPYC 7642, 16 vCPUs; **23.7 tok/s** at 1 vCPU, **118.1 tok/s** at 8 vCPUs, **136.6 tok/s** peak) and **55.4 tok/s** live on a **0 GB disk Proxmox VE VM** (Intel Xeon E5-2670 v3, 12 cores).
@@ -42,7 +42,7 @@ make os-check
 Expected output (`FAST_Q8=1`):
 
 ```text
--rwxr-xr-x 1 user user 24252 build/asm-llm-os.elf
+-rwxr-xr-x 1 user user 26012 build/asm-llm-os.elf
 build/asm-llm-os.elf: ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), statically linked, stripped
 There is no dynamic section in this file.
 ```
@@ -106,6 +106,8 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 2G -smp 16 \
   -bios /usr/share/ovmf/OVMF.fd \
   -cdrom build/asm-llm-os.iso -nographic
 ```
+
+UEFI has no VGA text mode. On a UEFI boot GRUB hands the kernel the firmware's GOP framebuffer (`gfxpayload=keep`), and `fbcon.asm` draws the same 80x25 colour console on it: 8x16 cells from the public-domain font8x8 glyphs, scaled 2x on screens of at least 1280x800, centred. 24 and 32 bpp direct-RGB modes below 4 GiB are supported. Other modes, or no framebuffer, fall back to the serial console. BIOS boots are unchanged and keep real VGA text mode. To see the screen under OVMF, drop `-nographic` and add `-serial stdio`. On real UEFI boards, PS/2 keyboard input depends on the firmware's legacy USB emulation. COM1 serial always works.
 
 ### Option C: Deploying on Proxmox VE (0 GB Disk VM)
 
@@ -188,6 +190,7 @@ Phase 2 compiles the exact same `shared/math.asm`, `shared/matmul.asm`, `shared/
 - **Bare-Metal SMP (`smp.asm`):** parses ACPI RSDP -> RSDT/XSDT -> MADT (`"APIC"`) with a Local APIC broadcast fallback, installs a position-independent 16->32->64-bit trampoline at `0x8000`, wakes all AP cores via Local APIC `INIT-SIPI-SIPI`, enables AVX2/FMA/MXCSR identically on every core, and dispatches both `matmul_q8_0` and `gqa_attn_range` (`FAST_Q8=1`) with a lock-free cache-line-isolated spin-barrier.
 - **Hardware Drivers (`drivers.asm`):**
   - **COM1 Serial (`0x3F8`, 115200 8N1):** raw UTF-8 TX and RX.
+  - **UEFI framebuffer console (`fbcon.asm`):** on UEFI boots, the 80x25 cells are kept in a shadow buffer and painted onto the GOP framebuffer passed by GRUB (Multiboot 1 video flag, 24/32 bpp). Only changed cells are repainted.
   - **80x25 Color VGA (`0xB8000`):** colored boot banner, hardware scrolling, batched CRTC cursor updates, and UTF-8 decoding with Cyrillic-to-ASCII fallback on VGA while streaming raw UTF-8 to COM1.
   - **PS/2 Keyboard (`0x60`/`0x64`):** scancode set 1 to ASCII (Shift, Backspace, Enter).
   - **PIT Channel 2 + RDTSC:** 20 ms hardware PIT calibration for accurate nanosecond boot/prefill/decode profiling.

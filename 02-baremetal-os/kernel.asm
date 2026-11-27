@@ -28,6 +28,7 @@ extern g_smp_online_cpus
 extern serial_init
 extern serial_putc
 extern vga_clear
+extern fb_init
 extern vga_set_color
 extern console_write
 extern console_write_cstr
@@ -73,6 +74,7 @@ kernel_main:
 
     ; 1. Early hardware init: COM1 Serial + Color VGA + PIT/RDTSC Timer
     call    serial_init
+    call    fb_init                     ; UEFI: draw the console on the GOP framebuffer
     mov     dil, VGA_ATTR_GREY
     call    vga_clear
 

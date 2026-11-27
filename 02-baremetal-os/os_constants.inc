@@ -5,9 +5,11 @@
 
 ; --- Multiboot 1 ---
 %define MB_HEADER_MAGIC     0x1BADB002
-%define MB_HEADER_FLAGS     0x00000003      ; PAGE_ALIGN | MEMORY_INFO
+%define MB_HEADER_FLAGS     0x00000007      ; PAGE_ALIGN | MEMORY_INFO | VIDEO_MODE
 %define MB_HEADER_CHECKSUM  (-(MB_HEADER_MAGIC + MB_HEADER_FLAGS))
 %define MB_BOOTLOADER_MAGIC 0x2BADB002
+%define MB_VIDEO_EGA_TEXT   1               ; header mode_type: prefer EGA text
+                                            ; (GRUB-EFI falls back to a framebuffer)
 
 ; Multiboot 1 Info struct offsets
 %define MBI_FLAGS           0
@@ -18,6 +20,24 @@
 %define MBI_MODS_ADDR       24
 %define MBI_MMAP_LENGTH     44
 %define MBI_MMAP_ADDR       48
+
+; Multiboot 1 framebuffer info (valid when MBI flags bit 12 is set)
+%define MBI_FLAG_FRAMEBUFFER 0x00001000
+%define MBI_FB_ADDR         88              ; uint64
+%define MBI_FB_PITCH        96
+%define MBI_FB_WIDTH        100
+%define MBI_FB_HEIGHT       104
+%define MBI_FB_BPP          108             ; uint8
+%define MBI_FB_TYPE         109             ; uint8: 0 indexed, 1 RGB, 2 EGA text
+; color_info is a union holding a uint32, so GRUB 4-byte aligns it to 112
+; (the spec's offset table says 110; real loaders put it at 112).
+%define MBI_FB_RED_POS      112
+%define MBI_FB_RED_SIZE     113
+%define MBI_FB_GREEN_POS    114
+%define MBI_FB_GREEN_SIZE   115
+%define MBI_FB_BLUE_POS     116
+%define MBI_FB_BLUE_SIZE    117
+%define MBI_FB_TYPE_RGB     1
 
 ; Multiboot module struct (16 bytes)
 %define MB_MOD_START        0
@@ -38,6 +58,13 @@
 %define VGA_ROWS            25
 %define VGA_CRTC_IDX        0x3D4
 %define VGA_CRTC_DATA       0x3D5
+
+; --- Framebuffer console (fbcon.asm): 80x25 cells of 8x16 px ---
+%define FB_GRID_W           (VGA_COLS * 8)  ; 640 px at scale 1
+%define FB_GRID_H           (VGA_ROWS * 16) ; 400 px at scale 1
+%define FB_MAX_SCALE        2               ; bounds full-redraw cost on 4K panels
+%define FB_MAP_LIMIT        0x100000000     ; boot.asm identity-maps 0..4 GiB
+%define FB_BLANK_CELL       0x0720          ; space on black: a cleared framebuffer
 
 ; VGA Color Attributes (bg<<4 | fg)
 %define VGA_ATTR_GREY       0x07
