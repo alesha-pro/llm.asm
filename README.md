@@ -10,7 +10,7 @@ Assembled directly with `nasm` and linked with `ld`. Every math kernel (`expf`, 
 | Project | Binary | Size | Deps | Key Numbers |
 |---|---|---:|---:|---|
 | **[01-qwen3-inference/](01-qwen3-inference/)** | `build/asm-llm` | **14,712 B** *(14,008 B `FAST_Q8=0`)* | **0** | Static Linux ELF running `Qwen/Qwen3-0.6B` (Q8_0, built-in BPE tokenizer, GQA + QK-Norm + RoPE + SwiGLU, single-shot & `--chat` multi-turn KV-cache REPL). **`FAST_Q8=1` (default):** **126.8 tok/s** decode at 40T (**20.7 tok/s** at 1T), **+18% to +36% faster than `llama.cpp` CPU (`Q8_0`) across 1..40T**, **`0.99965`** cosine & **64/64** exact greedy tokens vs PyTorch FP32. |
-| **[02-baremetal-os/](02-baremetal-os/)** | `build/asm-llm-os.elf` | **24,252 B** *(23,612 B `FAST_Q8=0`)* | **0** | Bootable bare-metal `Qwen3-0.6B` OS with no Linux or Windows. Multiboot 1 -> Long Mode -> AVX2/FMA/F16C -> ACPI/APIC SMP -> VGA + PS/2 + COM1 multi-turn KV-cache chat (`/clear`, `/think`, `/bench`). **74–94 ms** boot, **134.9 tok/s** KVM EPYC (**23.7 tok/s** 1 vCPU, **136.6 tok/s** peak), **55.4 tok/s** live on Proxmox Xeon E5-2670 v3 with **0 GB** disk. |
+| **[02-baremetal-os/](02-baremetal-os/)** | `build/asm-llm-os.elf` | **26,012 B** *(25,372 B `FAST_Q8=0`)* | **0** | Bootable bare-metal `Qwen3-0.6B` OS with no Linux or Windows. Multiboot 1 -> Long Mode -> AVX2/FMA/F16C -> ACPI/APIC SMP -> VGA + PS/2 + COM1 multi-turn KV-cache chat (`/clear`, `/think`, `/bench`). **74–94 ms** boot, **134.9 tok/s** KVM EPYC (**23.7 tok/s** 1 vCPU, **136.6 tok/s** peak), **55.4 tok/s** live on Proxmox Xeon E5-2670 v3 with **0 GB** disk. |
 | **[03-minigpt-train/](03-minigpt-train/)** | `build/asm-gpt-train` | **32,944 B** | **0** | From-scratch FP32 Mini-GPT trainer and sampler. Register-blocked `6x16` AVX2+FMA SGEMM, full analytical backward pass (**`1.0000000000`** cosine across all 21 gradient tensors vs PyTorch CPU), decoupled AdamW, **27,662 train tok/s**, live 80x24 Braille TUI, `val_loss 4.19 -> 1.51` on TinyShakespeare in 4 min. |
 
 ---
@@ -149,6 +149,7 @@ llm.asm/
 │   ├── README.md
 │   ├── boot.asm                   # Multiboot 1 -> 4-level paging -> Long Mode -> AVX2/FMA -> IDT
 │   ├── drivers.asm                # COM1 115200, 80x25 Color VGA, PS/2 keyboard, PIT+RDTSC, ACPI poweroff
+│   ├── fbcon.asm                  # 80x25 console on the UEFI GOP framebuffer (8x16 font8x8 cells)
 │   ├── kernel.asm                 # Kernel entrypoint, CPUID banner, cmdline parser, multi-turn chat REPL
 │   ├── linker.ld                  # Bare-metal linker script at 0x00100000
 │   ├── os_constants.inc           # Hardware, Multiboot 1, Local APIC, and SMP constants

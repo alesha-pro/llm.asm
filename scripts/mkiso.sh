@@ -34,7 +34,14 @@ mkdir -p "$ISO_ROOT/boot/grub"
 cp "$KERNEL_ELF" "$ISO_ROOT/boot/asm-llm-os.elf"
 
 # Note: quote cmdline carefully for GRUB2 multiboot command
+# On UEFI there is no VGA text mode: the kernel accepts a GOP framebuffer
+# instead (fbcon.asm). GRUB needs efi_gop loaded to pass one, and "keep" hands
+# over the firmware's current (native) mode rather than switching modes.
 cat > "$ISO_ROOT/boot/grub/grub.cfg" <<EOF
+if [ "\$grub_platform" = "efi" ]; then
+    insmod efi_gop
+    set gfxpayload=keep
+fi
 serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1
 terminal_input console serial
 terminal_output console serial
@@ -72,7 +79,7 @@ EOF
 grub-mkstandalone \
     -O x86_64-efi \
     -o "$WORK_DIR/efi_tree/EFI/BOOT/BOOTX64.EFI" \
-    --modules="part_gpt part_msdos iso9660 fat multiboot normal serial terminal search search_fs_file configfile" \
+    --modules="part_gpt part_msdos iso9660 fat multiboot normal serial terminal search search_fs_file configfile efi_gop" \
     "boot/grub/grub.cfg=$WORK_DIR/embed.cfg"
 
 # Create minimal FAT16 EFI System Partition image (zero root, zero mtools needed)
