@@ -104,6 +104,20 @@ There is no dynamic section in this file.
   -p "Объясни в двух предложениях, как работает стек вызовов в процессоре." -n 128 -t 16
 ```
 
+> **Note — `<think>` blocks stay in chat history (known deviation, #12):**
+> In `--chat`, the KV cache is append-only, so the prompt tokens of each
+> assistant turn stay in the history of every later turn. In no-think mode
+> that includes the empty `<think>\n\n</think>\n\n` block that the Qwen3
+> template adds to the *current* generation prompt, and with `/think` it
+> includes the full reasoning text of earlier turns. The official Qwen3
+> chat template renders past assistant turns *without* the think block
+> and strips reasoning from history, so the context here differs from
+> the official format, and reasoning text also uses up the 2048-token
+> context faster. This is a trade-off of the append-only KV-cache
+> design, not an engine bug: the cached history is token-identical to
+> a full recompute of the same tokens. Use `/clear` to start a fresh
+> history when the context fills up.
+
 ---
 
 ## CLI Reference
