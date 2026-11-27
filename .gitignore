@@ -1,3 +1,4 @@
+.env
 *.o
 *.bin
 *.asmbin
@@ -5,6 +6,8 @@
 *.safetensors
 *.ckpt
 *.iso
+*.r1m
+*.sqlite*
 build/
 runs/
 models/

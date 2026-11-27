@@ -1,0 +1,34 @@
+base_model_or_sft_ckpt: runs/sft-minicpm5-2b/merged
+base_model_fallback: models/minicpm5-2b-bf16
+cuda_visible_devices: "0,1"
+scenarios_file: dataset/scenarios_600.jsonl
+output_dir: runs/grpo-minicpm5-2b
+tensorboard_dir: runs/tb-logs/grpo-minicpm5-2b
+
+num_generations: 4
+max_prompt_length: 1024
+max_completion_length: 64
+bf16: true
+beta: 0.08
+temperature: 0.95
+top_p: 0.95
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-6
+lr_scheduler_type: cosine
+warmup_steps: 4
+max_steps: 40
+logging_steps: 1
+save_steps: 20
+seed: 42
+
+kvm_verifier:
+  max_workers: 4
+  use_cache: true
