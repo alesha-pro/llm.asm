@@ -139,6 +139,22 @@ qm terminal 250
 
 *(Note: `--cpu host` is required so the VM exposes AVX2 + FMA, and `--balloon 0` ensures 2 GiB of contiguous guest RAM for the 649 MiB model + 449 MiB KV-cache arena.)*
 
+### Option D: OpenAI-Compatible API over the Serial Console
+
+The OS has no network driver, but its COM1 console is enough to serve it over HTTP. [`relay/`](relay/) is a single-file, standard-library Python relay: QEMU connects COM1 to it as a TCP client (`-chardev socket,...,reconnect-ms=5000 -serial chardev:...`), and it serves `/v1/models`, `/v1/chat/completions` and `/v1/completions` (with streaming and Qwen3 function tool calls), so OpenAI clients such as OpenCode can talk to the bare-metal model:
+
+```bash
+LLM_BOOT_MAX_TOKENS=256 python3 02-baremetal-os/relay/llm-relay.py &
+qemu-system-x86_64 -enable-kvm -cpu host -m 2G -smp 4 \
+  -kernel build/asm-llm-os.elf -initrd models/qwen3-0.6b-q8_0.asmbin \
+  -append 'max_tokens=256' -display none \
+  -chardev socket,id=llm0,host=127.0.0.1,port=7000,reconnect-ms=5000 -serial chardev:llm0
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-0.6b-llm.asm","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+See [relay/README.md](relay/README.md) for Proxmox setup, OpenCode configuration, tool-call limits, and how chat messages map onto the one-line console.
+
 ---
 
 ## Interactive Multi-Turn Chat & Kernel Cmdline
