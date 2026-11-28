@@ -13,6 +13,7 @@
 ; ============================================================================
 
 %include "os_constants.inc"
+%include "uefi_handoff.inc"
 
 extern _bss_start
 extern _bss_end
@@ -31,14 +32,27 @@ global g_mb_magic
 global g_mb_info
 global g_boot_tsc
 global g_has_avx2_fma
+global g_boot_path
+global g_uefi_model_base
+global g_uefi_model_size
+global g_uefi_rsdp
 
 ; ============================================================================
 ; Multiboot 1 Header (must reside in first 8192 bytes of ELF file)
 ; ============================================================================
-section .multiboot align=4
+section .multiboot align=8
     dd MB_HEADER_MAGIC
     dd MB_HEADER_FLAGS
     dd MB_HEADER_CHECKSUM
+
+; UEFI kernel header (see uefi_handoff.inc). Ignored by Multiboot loaders;
+; BOOTX64.EFI scans the first 8 KiB of the image for it to find uefi_entry64.
+align 8
+uefi_kernel_header:
+    dq UEFI_KHDR_MAGIC
+    dq uefi_entry64
+    dd UEFI_HANDOFF_VERSION
+    dd 0
 
 ; ============================================================================
 ; 32-bit Protected Mode Bootstrap
@@ -75,10 +89,10 @@ _start:
     mov     [g_boot_tsc], eax
     mov     [g_boot_tsc + 4], edx
 
-    ; Zero page tables (6 pages = 24 KiB = 6144 dwords)
+    ; Zero page tables (10 pages = 40 KiB = 10240 dwords)
     mov     edi, pml4_table
     xor     eax, eax
-    mov     ecx, (6 * 4096) / 4
+    mov     ecx, (18 * 4096) / 4
     rep     stosd
 
     ; PML4[0] -> pdpt_table | Present | Writable (0x03)
@@ -86,39 +100,53 @@ _start:
     or      eax, 0x03
     mov     [pml4_table], eax
 
-    ; PDPT[0..3] -> pd_tables[0..3] | Present | Writable (0x03)
+    ; PDPT[0..15] -> 16 page directories (16 GiB identity mapping)
     mov     eax, pd_tables
     or      eax, 0x03
-    mov     [pdpt_table + 0], eax
+    mov     edi, pdpt_table
+    mov     ecx, 16
+.fill_pdpt:
+    mov     [edi], eax
+    mov     dword [edi + 4], 0
     add     eax, 4096
-    mov     [pdpt_table + 8], eax
-    add     eax, 4096
-    mov     [pdpt_table + 16], eax
-    add     eax, 4096
-    mov     [pdpt_table + 24], eax
+    add     edi, 8
+    dec     ecx
+    jnz     .fill_pdpt
 
-    ; Fill all 4 * 512 = 2048 PD entries with 2 MiB huge pages (0..4 GiB)
-    ; Entries 0..2031 (0x00000000..0xFDFFFFFF): flags 0x83 (P | RW | PS)
-    ; Entries 2032..2047 (0xFE000000..0xFFFFFFFF): flags 0x9B (P | RW | PWT | PCD | PS)
-    ;   -> Strong Uncacheable (UC) for Local APIC (0xFEE00000) & IOAPIC MMIO!
+    ; Fill 16 * 512 = 8192 PD entries: identity-map 0..16 GiB
+    ; Each PDE maps 2 MiB. EDX tracks the high 32 bits of the physical address.
+    ; Preserve UC MMIO flags for 0xFE000000..0xFFFFFFFF in the first 4 GiB.
     mov     edi, pd_tables
-    xor     ebx, ebx                    ; physical address = 0
-    xor     ecx, ecx                    ; entry index = 0..2047
+    xor     ebx, ebx                    ; physical address low 32 bits
+    xor     edx, edx                    ; physical address high 32 bits
+    xor     ecx, ecx                    ; entry index 0..4095
 .fill_pd:
     mov     eax, ebx
+
+    ; 0..2031: normal RAM mappings
+    ; 2032..2047: original MMIO range (0xFE000000..0xFFFFFFFF)
+    ; 2048..4095: high-memory mappings, normal RAM flags
     cmp     ecx, 2032
-    jae     .mmio_flags
+    jb      .normal_flags
+
+    cmp     ecx, 2048
+    jb      .mmio_flags
+
+.normal_flags:
     or      eax, 0x83
     jmp     .store_pde
+
 .mmio_flags:
     or      eax, 0x9B
+
 .store_pde:
     mov     [edi], eax
-    mov     dword [edi + 4], 0          ; upper 32 bits = 0 (all < 4 GiB)
+    mov     [edi + 4], edx              ; high 32 bits of physical address
     add     edi, 8
-    add     ebx, 0x00200000             ; +2 MiB
+    add     ebx, 0x00200000             ; advance by 2 MiB
+    adc     edx, 0                     ; carry into high 32 bits
     inc     ecx
-    cmp     ecx, 2048
+    cmp     ecx, 8192
     jb      .fill_pd
 
     ; Load CR3 with PML4 physical address
@@ -185,6 +213,119 @@ long_mode_start:
     cli
     hlt
     jmp     .halt_forever
+
+; ============================================================================
+; 64-bit UEFI Entry (from BOOTX64.EFI after ExitBootServices)
+;
+; In:  64-bit long mode, firmware page tables/GDT, interrupts in any state,
+;      RDI = handoff struct (uefi_handoff.inc, below 4 GiB).
+; Out: same machine state as the Multiboot path at long_mode_start: our own
+;      16 GiB identity map, our GDT, zeroed .bss, g_mb_magic/g_mb_info pointing
+;      at the loader-synthesized MB1 info block, plus the 64-bit model
+;      base/size in g_uefi_model_base/size.
+; The firmware stack is abandoned; no stack is used before bsp_stack_top.
+; ============================================================================
+uefi_entry64:
+    cli
+    cld
+    mov     r12, rdi                    ; handoff (outside kernel image)
+
+    mov     rax, HANDOFF_MAGIC
+    cmp     [r12 + HO_MAGIC], rax
+    jne     .bad_handoff
+
+    ; Zero .bss (page tables, stacks, globals) exactly like _start does
+    lea     rdi, [rel _bss_start]
+    lea     rcx, [rel _bss_end]
+    sub     rcx, rdi
+    shr     rcx, 3
+    xor     eax, eax
+    rep     stosq
+
+    lea     rsp, [rel bsp_stack_top]
+
+    rdtsc
+    mov     [rel g_boot_tsc], eax
+    mov     [rel g_boot_tsc + 4], edx
+
+    ; Present the loader's MB1-format info block to the unchanged kernel paths
+    mov     dword [rel g_mb_magic], MB_BOOTLOADER_MAGIC
+    mov     rax, [r12 + HO_MBI_PTR]
+    mov     [rel g_mb_info], eax        ; loader guarantees < 4 GiB
+    mov     rax, [r12 + HO_MODEL_BASE]
+    mov     [rel g_uefi_model_base], rax
+    mov     rax, [r12 + HO_MODEL_SIZE]
+    mov     [rel g_uefi_model_size], rax
+    mov     rax, [r12 + HO_RSDP]
+    mov     [rel g_uefi_rsdp], rax
+    mov     dword [rel g_boot_path], BOOT_PATH_UEFI
+
+    ; Build the same 16 GiB identity map as the 32-bit path
+    call    build_identity_map64
+
+    ; Drop firmware global TLB entries (CR4.PGE off), then switch CR3
+    mov     rax, cr4
+    and     rax, ~(1 << 7)
+    mov     cr4, rax
+    lea     rax, [rel pml4_table]
+    mov     cr3, rax
+
+    ; Load our GDT and reload CS = 0x08 via far return
+    lgdt    [rel gdt64_ptr]
+    push    0x08
+    lea     rax, [rel long_mode_start]
+    push    rax
+    retfq
+
+.bad_handoff:
+    cli
+    hlt
+    jmp     .bad_handoff
+
+; ----------------------------------------------------------------------------
+; build_identity_map64: 64-bit twin of the 32-bit page-table builder in _start.
+; PML4[0] -> PDPT[0..15] -> 16 PDs x 512 x 2 MiB = 0..16 GiB identity map.
+; 0xFE000000..0xFFFFFFFF (PDE 2032..2047) mapped UC for LAPIC/IOAPIC MMIO.
+; Assumes the tables are already zero (.bss).
+; ----------------------------------------------------------------------------
+build_identity_map64:
+    lea     rax, [rel pdpt_table]
+    or      rax, 0x03
+    mov     [rel pml4_table], rax
+
+    lea     rax, [rel pd_tables]
+    or      rax, 0x03
+    lea     rdi, [rel pdpt_table]
+    mov     ecx, 16
+.pdpt:
+    mov     [rdi], rax
+    add     rax, 4096
+    add     rdi, 8
+    dec     ecx
+    jnz     .pdpt
+
+    lea     rdi, [rel pd_tables]
+    xor     eax, eax                    ; physical address
+    xor     ecx, ecx                    ; PDE index 0..8191
+.pd:
+    mov     rdx, rax
+    cmp     ecx, 2032
+    jb      .ram
+    cmp     ecx, 2048
+    jb      .mmio
+.ram:
+    or      rdx, 0x83                   ; P | RW | PS
+    jmp     .store
+.mmio:
+    or      rdx, 0x9B                   ; P | RW | PWT | PCD | PS
+.store:
+    mov     [rdi], rdx
+    add     rdi, 8
+    add     rax, 0x00200000
+    inc     ecx
+    cmp     ecx, 8192
+    jb      .pd
+    ret
 
 ; ----------------------------------------------------------------------------
 ; uint32 check_cpu_features(void) -> eax = 1 if XSAVE+AVX+FMA+AVX2 supported
@@ -396,7 +537,7 @@ section .bss
 alignb 4096
 pml4_table:     resb 4096
 pdpt_table:     resb 4096
-pd_tables:      resb 4 * 4096           ; 4 x 512 x 2 MiB = 4 GiB identity map
+pd_tables:      resb 16 * 4096           ; 16 x 512 x 2 MiB = 16 GiB identity map
 
 alignb 16
 idt64:          resb 32 * 16
@@ -410,3 +551,8 @@ g_boot_tsc:     resq 1
 g_mb_magic:     resd 1
 g_mb_info:      resd 1
 g_has_avx2_fma: resd 1
+g_boot_path:    resd 1                  ; BOOT_PATH_MULTIBOOT1 (0) / BOOT_PATH_UEFI (1)
+alignb 8
+g_uefi_model_base: resq 1
+g_uefi_model_size: resq 1
+g_uefi_rsdp:    resq 1

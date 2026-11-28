@@ -17,6 +17,7 @@ default rel
 %define FAST_Q8 1
 %endif
 
+extern g_uefi_rsdp
 extern pml4_table
 extern gdt64_ptr
 extern idt64_ptr
@@ -312,6 +313,16 @@ acpi_discover_madt:
     mov     dword [rel n_ap_ids], 0
     mov     dword [rel g_smp_total_cpus], 1
 
+    ; 0. UEFI boot: RSDP handed over from the firmware configuration table
+    mov     rax, [rel g_uefi_rsdp]
+    test    rax, rax
+    jz      .scan_ebda
+    cmp     dword [rax], 'RSD '
+    jne     .scan_ebda
+    cmp     dword [rax + 4], 'PTR '
+    je      .have_rsdp
+
+.scan_ebda:
     ; 1. Scan EBDA (BDA 0x40E << 4, 1 KiB)
     movzx   rdi, word [abs 0x40E]
     shl     rdi, 4
