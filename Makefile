@@ -7,6 +7,7 @@ BUILD   := build
 
 # Portable defaults (override on CLI, e.g. make inference FAST_Q8=0)
 FAST_Q8 ?= 1
+AVX1    ?= 0
 MODEL   ?= models/qwen3-0.6b-q8_0.asmbin
 DATA    ?= data/tinyshakespeare.txt
 SMP     ?= 16
@@ -14,11 +15,11 @@ RAM     ?= 2G
 CMDLINE ?=
 
 # Stamp file tracks FAST_Q8 compile-time toggle so toggling rebuilds cleanly
-FAST_Q8_STAMP := $(BUILD)/.fast_q8_$(FAST_Q8)
+FAST_Q8_STAMP := $(BUILD)/.flags_$(FAST_Q8)_avx$(AVX1)
 
 # --- Shared x86-64 NASM modules ---
 SHARED_DIR := shared
-AFLAGS     := -f elf64 -DFAST_Q8=$(FAST_Q8) -I$(SHARED_DIR)/
+AFLAGS     := -f elf64 -DFAST_Q8=$(FAST_Q8) -DAVX1=$(AVX1) -I$(SHARED_DIR)/
 
 # --- Phase 1: Qwen3-0.6B Linux Inference Engine (12 KB static ELF) ---
 P1_DIR  := 01-qwen3-inference
@@ -47,7 +48,7 @@ OS_BUILD   := $(BUILD)/os
 OS_ELF64   := $(OS_BUILD)/asm-llm-os.elf64
 OS_ELF     := $(BUILD)/asm-llm-os.elf
 OS_ISO     := $(BUILD)/asm-llm-os.iso
-OS_AFLAGS  := -f elf64 -DBARE_METAL -DFAST_Q8=$(FAST_Q8) -I$(SHARED_DIR)/ -I$(P2_DIR)/
+OS_AFLAGS  := -f elf64 -DBARE_METAL -DFAST_Q8=$(FAST_Q8) -DAVX1=$(AVX1) -I$(SHARED_DIR)/ -I$(P2_DIR)/
 OS_LDFLAGS := -m elf_x86_64 -T $(P2_DIR)/linker.ld --gc-sections -s -z max-page-size=0x1000 -z noexecstack
 
 OS_OBJS := \
@@ -89,7 +90,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(FAST_Q8_STAMP): | $(BUILD)
-	rm -f $(BUILD)/.fast_q8_* && touch $@
+	rm -f $(BUILD)/.fast_q8_* $(BUILD)/.flags_* && touch $@
 
 $(BUILD)/%.o: $(SHARED_DIR)/%.asm $(SHARED_DIR)/constants.inc $(FAST_Q8_STAMP) | $(BUILD)
 	$(NASM) $(AFLAGS) $< -o $@
