@@ -209,6 +209,41 @@ model_init:
     add     rax, r15
     mov     [rbx + CTX_FINAL_NORM_PTR], rax
 
+    ; LM head: tied -> embed_tokens; untied -> header off_lm_head, validated:
+    ; nonzero, 64-byte aligned, past the header, dim % 32 == 0, and
+    ; [off, off + vocab * (dim + dim/32 * scale_bytes)) inside the file.
+    mov     rax, [rbx + CTX_EMB_PTR]
+    test    dword [r15 + HDR_FLAGS], HDR_FLAG_TIED_EMB
+    jnz     .lmh_set
+    mov     rax, [r15 + HDR_OFF_LM_HEAD]
+    test    rax, rax
+    jz      .err_bad_hdr                ; untied model exported without lm_head
+    test    rax, 63
+    jnz     .err_bad_hdr
+    cmp     rax, 128                    ; header size
+    jb      .err_bad_hdr
+    mov     rcx, [rbx + CTX_DIM]
+    test    rcx, 31
+    jnz     .err_bad_hdr
+    mov     rdx, rcx
+    shr     rdx, 5                      ; blocks per row
+    shl     rdx, 1                      ; * 2 B fp16 scales
+    cmp     dword [rbx + CTX_FP16_SCALES], 0
+    jne     .lmh_row
+    shl     rdx, 1                      ; * 4 B fp32 scales
+.lmh_row:
+    add     rcx, rdx                    ; row bytes
+    imul    rcx, [rbx + CTX_VOCAB_SIZE] ; tensor bytes (64-bit)
+    jo      .err_bad_hdr
+    mov     rdx, rax
+    add     rdx, rcx                    ; end offset
+    jc      .err_bad_hdr
+    cmp     rdx, r14                    ; <= mapped file size
+    ja      .err_bad_hdr
+    add     rax, r15                    ; absolute 64-bit pointer
+.lmh_set:
+    mov     [rbx + CTX_LMHEAD_PTR], rax
+
     ; Compute single anonymous mmap arena size for all activation buffers + KV cache
     ; First pass: compute exact aligned offsets (stored temporarily as relative offsets!)
     xor     rbp, rbp                    ; running offset = 0
@@ -809,7 +844,7 @@ transformer_forward:
     cmp     qword [rsp + 8], 0
     je      .done
 
-    ; 4. Final RMSNorm + tied LM-head projection -> buf_logits
+    ; 4. Final RMSNorm + LM-head projection -> buf_logits
     mov     rdi, [rbx + CTX_BUF_X]
     mov     rsi, [rbx + CTX_BUF_X]
     mov     rdx, [rbx + CTX_FINAL_NORM_PTR]
@@ -817,7 +852,7 @@ transformer_forward:
     vmovss  xmm0, [rbx + CTX_RMS_EPS]
     call    rmsnorm_avx2
 
-    mov     rdi, [rbx + CTX_EMB_PTR]    ; tied embeddings!
+    mov     rdi, [rbx + CTX_LMHEAD_PTR] ; lm_head (== embed when tied)
     mov     rsi, [rbx + CTX_BUF_X]
     mov     rdx, [rbx + CTX_BUF_LOGITS]
     mov     rcx, [rbx + CTX_VOCAB_SIZE]

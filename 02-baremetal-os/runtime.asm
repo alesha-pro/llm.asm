@@ -21,6 +21,7 @@ extern timer_ns
 section .text
 
 global mem_init
+global highmem_test
 global sys_mmap_anon
 global sys_munmap
 global sys_write_all
@@ -110,7 +111,7 @@ mem_init:
     jae     .s_ok
     mov     r8, r14
 .s_ok:
-    mov     rax, 0xF0000000
+    mov     rax, 0x400000000           ; 8 GiB mapped RAM boundary
     cmp     r9, rax
     jbe     .e_ok
     mov     r9, rax
@@ -236,6 +237,136 @@ mem_init:
     ret
 
 ; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; int highmem_test(uint64 multiboot_info in rdi)
+;
+; Finds usable RAM above 4 GiB from the Multiboot memory map and performs
+; a reversible 64-bit read/write test.
+;
+; Returns:
+;   RAX =  0  test passed
+;   RAX = -1  no suitable RAM found or memory test failed
+;   RDX = tested physical address on success
+;
+; Requires the identity mapping to include the selected high-memory address.
+; ----------------------------------------------------------------------------
+highmem_test:
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    mov     r12, rdi                    ; Multiboot info
+    mov     ebx, [r12 + MBI_MMAP_ADDR]  ; mmap start
+    mov     ebp, [r12 + MBI_MMAP_LENGTH]
+    add     rbp, rbx                    ; mmap end
+
+ .scan:
+    cmp     rbx, rbp
+    jae     .fail
+
+    ; Validate mmap entry size (minimum 20 bytes after size field)
+    mov     r15d, [rbx]
+    cmp     r15d, 20
+    jb      .fail
+
+    ; Ensure the complete entry is inside the mmap buffer
+    lea     rax, [rbx + r15 + 4]
+    cmp     rax, rbp
+    ja      .fail
+
+    ; Only test usable RAM (type 1)
+    cmp     dword [rbx + 20], 1
+    jne     .next
+
+    ; Read 64-bit region base and length
+    mov     rax, [rbx + 4]
+    mov     rdx, [rbx + 12]
+
+    ; Calculate region end; skip overflow
+    add     rdx, rax
+    jc      .next
+
+    ; Clamp region end to our currently mapped 0-16 GiB range
+    mov     r10, 0x400000000
+    cmp     rdx, r10
+    jbe     .end_ok
+    mov     rdx, r10
+.end_ok:
+
+    ; Region must extend above 4 GiB
+    mov     r10, 0x100000000
+    cmp     rdx, r10
+    jbe     .next
+
+    ; Start at max(region base, 4 GiB)
+    cmp     rax, r10
+    jae     .base_ok
+    mov     rax, r10
+
+.base_ok:
+    ; Keep away from the beginning of the region
+    add     rax, 0x100000
+    jc      .next
+
+    ; Align the test address to 8 bytes
+    add     rax, 7
+    and     rax, -8
+
+    ; Ensure an entire 8-byte test location remains inside the region
+    lea     r10, [rax + 8]
+    cmp     r10, rdx
+    ja      .next
+
+    mov     r13, rax                    ; Test address
+    mov     r14, [r13]                 ; Save original value
+
+    ; Test pattern 1
+    mov     rax, 0xA55AA55A12345678
+    mov     [r13], rax
+    cmp     [r13], rax
+    jne     .test_failed
+
+    ; Test pattern 2 (complement)
+    mov     rax, 0x5AA55AA5EDCBA987
+    mov     [r13], rax
+    cmp     [r13], rax
+    jne     .test_failed
+
+    ; Restore original memory contents
+    mov     [r13], r14
+
+    xor     eax, eax                    ; PASS
+    mov     rdx, r13                    ; Return tested address
+    jmp     .done
+
+.test_failed:
+    ; Always restore the original value
+    mov     [r13], r14
+    jmp     .fail
+
+.next:
+    ; Advance using the validated variable entry size.
+    add     rbx, r15
+    add     rbx, 4
+    jmp     .scan
+
+.fail:
+    mov     rax, -1
+    xor     edx, edx
+
+.done:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+
 ; void *sys_mmap_anon(uint64 size in rdi)
 ; Allocates 64-byte-aligned zeroed memory from the bare-metal physical arena.
 ; Returns pointer on success, -1 on OOM.
@@ -283,6 +414,67 @@ sys_mmap_anon:
     ret
 
 ; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; int64 highmem_alloc_test(void)
+; Tests the real allocator by allocating 4 KiB from the heap.
+; Returns RAX=0 on success, -1 on failure; RDX=allocation address on success.
+; ----------------------------------------------------------------------------
+global highmem_alloc_test
+highmem_alloc_test:
+    push    r12
+    push    r13
+    push    r14
+
+    mov     edi, 4096
+    call    sys_mmap_anon
+    cmp     rax, -1
+    je      .alloc_fail
+
+    mov     r12, rax                    ; Allocation address
+
+    ; Ensure allocation is above 4 GiB
+    mov     rax, 0x100000000
+    cmp     r12, rax
+    jb      .test_fail
+
+    ; Verify all 4096 bytes were zeroed
+    mov     r13, r12
+    mov     r14d, 512                   ; 4096 / 8
+.zero_check:
+    cmp     qword [r13], 0
+    jne     .test_fail
+    add     r13, 8
+    dec     r14
+    jnz     .zero_check
+
+    ; Write and verify first qword
+    mov     rax, 0xA55AA55A12345678
+    mov     [r12], rax
+    cmp     [r12], rax
+    jne     .test_fail
+
+    ; Write and verify last qword
+    mov     rax, 0x5AA55AA5EDCBA987
+    mov     [r12 + 4088], rax
+    cmp     [r12 + 4088], rax
+    jne     .test_fail
+
+    mov     rdx, r12
+    xor     eax, eax                    ; PASS
+    jmp     .test_done
+
+.alloc_fail:
+.test_fail:
+    mov     rax, -1
+    xor     edx, edx
+
+.test_done:
+    pop     r14
+    pop     r13
+    pop     r12
+    ret
+
 ; int64 sys_munmap(void *addr, uint64 size) -> no-op in bare-metal bump arena
 ; ----------------------------------------------------------------------------
 sys_munmap:

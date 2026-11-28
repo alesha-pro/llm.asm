@@ -14,11 +14,15 @@ default rel
 
 %include "constants.inc"
 %include "os_constants.inc"
+%include "uefi_handoff.inc"
 
 extern g_ctx
 extern g_mb_magic
 extern g_mb_info
 extern g_has_avx2_fma
+extern g_boot_path
+extern g_uefi_model_base
+extern g_uefi_model_size
 extern g_tsc_mhz
 extern g_total_ram_mb
 extern g_arena_used_mb
@@ -37,6 +41,11 @@ extern timer_ns
 extern qemu_shutdown
 
 extern mem_init
+extern g_heap_base
+extern g_heap_end
+extern highmem_test
+extern sys_mmap_anon
+extern highmem_alloc_test
 extern smp_init
 extern tp_shutdown
 extern model_init
@@ -129,6 +138,19 @@ kernel_main:
     call    parse_cmdline
 .no_cmdline:
 
+    ; Locate .asmbin: UEFI handoff (full 64-bit base/size, may be > 4 GiB)
+    ; or the Multiboot 1 module (32-bit mod_start/mod_end, legacy fallback)
+    cmp     dword [rel g_boot_path], BOOT_PATH_UEFI
+    jne     .mb1_module
+    mov     r13, [rel g_uefi_model_base] ; r13 = model base
+    mov     r14, [rel g_uefi_model_size]
+    test    r14, r14
+    jz      .err_no_module
+    add     r14, r13                    ; r14 = model end
+    jc      .err_no_module
+    jmp     .have_module
+
+.mb1_module:
     ; Locate .asmbin Multiboot module (flags bit 3 = 0x08, mods_count >= 1)
     mov     eax, [r12 + MBI_FLAGS]
     test    eax, 0x08
@@ -140,6 +162,7 @@ kernel_main:
     mov     eax, [r12 + MBI_MODS_ADDR]  ; ptr to first mb_module_t
     mov     r13d, [rax + MB_MOD_START]  ; r13 = mod_start
     mov     r14d, [rax + MB_MOD_END]    ; r14 = mod_end
+.have_module:
     cmp     r14, r13
     jbe     .err_no_module
     mov     [rel g_mod_start], r13
@@ -159,6 +182,71 @@ kernel_main:
     call    mem_init
     test    rax, rax
     js      .err_oom
+
+    ; Diagnostic: display allocator-selected heap boundaries
+    mov     edi, 1
+    lea     rsi, [rel msg_heap_base]
+    call    write_cstr
+    mov     rdi, [rel g_heap_base]
+    call    write_hex64_raw
+
+    mov     edi, 1
+    lea     rsi, [rel msg_heap_end]
+    call    write_cstr
+    mov     rdi, [rel g_heap_end]
+    call    write_hex64_raw
+
+    mov     edi, 1
+    lea     rsi, [rel msg_nl]
+    call    write_cstr
+
+    ; 3.5 Verify read/write access to RAM above 4 GiB
+    mov     rdi, r12
+    call    highmem_test
+    test    rax, rax
+    js      .highmem_failed
+
+    push    rdx                         ; Preserve tested address
+    mov     edi, 1
+    lea     rsi, [rel msg_highmem_pass]
+    call    write_cstr
+    pop     rdi
+    call    write_hex64_raw
+    mov     edi, 1
+    lea     rsi, [rel msg_nl]
+    call    write_cstr
+    jmp     .highmem_done
+
+.highmem_failed:
+    mov     edi, 1
+    lea     rsi, [rel msg_highmem_fail]
+    call    write_cstr
+
+.highmem_done:
+
+    ; 3.6 Test real heap allocation above 4 GiB
+    call    highmem_alloc_test
+    test    rax, rax
+    js      .alloc_test_failed
+
+    push    rdx
+    mov     edi, 1
+    lea     rsi, [rel msg_alloc_test_pass]
+    call    write_cstr
+    pop     rdi
+    call    write_hex64_raw
+
+    mov     edi, 1
+    lea     rsi, [rel msg_nl]
+    call    write_cstr
+    jmp     .alloc_test_done
+
+.alloc_test_failed:
+    mov     edi, 1
+    lea     rsi, [rel msg_alloc_test_fail]
+    call    write_cstr
+
+.alloc_test_done:
 
     ; 4. Boot all SMP AP cores via Local APIC INIT-SIPI-SIPI + 16-bit trampoline
     mov     rdi, [rel opt_req_threads]
@@ -932,6 +1020,13 @@ print_boot_banner:
     mov     dil, VGA_ATTR_GREY
     call    vga_set_color
     mov     edi, 1
+    lea     rsi, [rel ban_mod_sep]
+    call    write_cstr
+    lea     rax, [rel g_ctx]
+    mov     edi, 1
+    mov     rsi, [rax + CTX_N_LAYERS]
+    call    write_u64
+    mov     edi, 1
     lea     rsi, [rel ban_mod_ctx]
     call    write_cstr
     lea     rax, [rel g_ctx]
@@ -1291,7 +1386,7 @@ d_1e6:          dq 1000000.0
 d_1e9:          dq 1000000000.0
 
 ban_line:       db "==============================================================================", 10, 0
-ban_title:      db "  asm-llm OS v2.0 | Bare-Metal Qwen3-0.6B in 100% Pure x86-64 Assembly", 10, 0
+ban_title:      db "  asm-llm OS v2.0 | Bare-Metal Qwen3 in 100% Pure x86-64 Assembly", 10, 0
 ban_cpu:        db "  CPU   : ", 0
 ban_avx_tsc:    db " (AVX2+FMA, ", 0
 ban_mhz_nl:     db " MHz)", 10, 0
@@ -1301,9 +1396,10 @@ ban_ram:        db "  RAM   : ", 0
 ban_ram_mid:    db " MiB | Arena: ", 0
 ban_boot_lbl:   db " MiB | Boot: ", 0
 ban_model:      db "  Model : ", 0
-ban_qwen:       db "Qwen3-0.6B Q8_0 (", 0
+ban_qwen:       db "Qwen3 Q8_0 (", 0
 ban_mod_at:     db " MiB @ 0x", 0
-ban_mod_ctx:    db ", 28L, ctx=", 0
+ban_mod_sep:    db ", ", 0
+ban_mod_ctx:    db "L, ctx=", 0
 
 msg_prompt_lbl: db "Prompt: ", 0
 msg_repl_help:  db "Interactive Bare-Metal Chat (/clear, /think, /nothink, /bench, /halt, /help)", 10, 0
@@ -1313,6 +1409,12 @@ msg_ctx_full:   db "[chat] context full, resetting KV-cache", 10, 0
 msg_think_on:   db "[mode] think=1 (Qwen3 reasoning enabled)", 10, 0
 msg_think_off:  db "[mode] think=0 (direct answer mode)", 10, 0
 msg_poweroff:   db "Powering off bare-metal VM...", 10, 0
+msg_heap_base:    db "HEAP BASE: 0x", 0
+msg_heap_end:     db " | HEAP END: 0x", 0
+msg_highmem_pass: db "HIGHMEM TEST: PASS | Address: 0x", 0
+msg_highmem_fail: db "HIGHMEM TEST: FAIL (no usable/testable RAM above 4 GiB)", 10, 0
+msg_alloc_test_pass: db "ALLOC TEST: PASS | Address: 0x", 0
+msg_alloc_test_fail: db "ALLOC TEST: FAIL (allocation/zero/read-write verification)", 10, 0
 
 msg_nl:         db 10, 0
 msg_comma:      db ","

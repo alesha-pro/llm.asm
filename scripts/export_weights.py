@@ -69,6 +69,49 @@ def load_safetensors_header(path: str):
     return hdr, data_offset
 
 
+class TensorStore:
+    """Read tensors transparently from single or sharded safetensors files."""
+
+    def __init__(self, model_dir: str):
+        self.model_dir = model_dir
+        self.index_path = os.path.join(model_dir, "model.safetensors.index.json")
+        self.single_path = os.path.join(model_dir, "model.safetensors")
+        self.headers = {}
+        self.files = {}
+        self.weight_map = {}
+
+        if os.path.isfile(self.index_path):
+            with open(self.index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            self.weight_map = index["weight_map"]
+            shard_names = sorted(set(self.weight_map.values()))
+            print(f"Detected sharded model: {len(shard_names)} shards")
+            for shard in shard_names:
+                path = os.path.join(model_dir, shard)
+                hdr, data_offset = load_safetensors_header(path)
+                self.headers[shard] = (hdr, data_offset)
+        elif os.path.isfile(self.single_path):
+            hdr, data_offset = load_safetensors_header(self.single_path)
+            self.headers["model.safetensors"] = (hdr, data_offset)
+            self.weight_map = {
+                name: "model.safetensors" for name in hdr if name != "__metadata__"
+            }
+            print("Detected single-file model")
+        else:
+            raise FileNotFoundError(
+                "No model.safetensors or model.safetensors.index.json found"
+            )
+
+    def read(self, name: str) -> np.ndarray:
+        shard = self.weight_map.get(name)
+        if shard is None:
+            raise KeyError(f"Tensor not found in model index: {name}")
+        hdr, data_offset = self.headers[shard]
+        path = os.path.join(self.model_dir, shard)
+        with open(path, "rb") as f:
+            return read_tensor_f32(f, hdr, data_offset, name)
+
+
 def read_tensor_f32(f, hdr, data_offset: int, name: str) -> np.ndarray:
     meta = hdr[name]
     dtype = meta["dtype"]
@@ -237,15 +280,15 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
     rms_norm_eps = float(cfg["rms_norm_eps"])
     rope_theta = float(cfg["rope_theta"])
     tie_emb = bool(cfg.get("tie_word_embeddings", True))
+    assert dim % 32 == 0, f"hidden_size={dim} must be a multiple of 32 for Q8_0"
 
-    st_path = os.path.join(model_dir, "model.safetensors")
+    tensor_store = TensorStore(model_dir)
     tok_path = os.path.join(model_dir, "tokenizer.json")
-    hdr, data_offset = load_safetensors_header(st_path)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     tok_blob = build_tokenizer_blob(tok_path, vocab_size)
 
-    with open(st_path, "rb") as sf, open(out_path, "wb") as out:
+    with open(out_path, "wb") as out:
         # Reserve header
         out.write(b"\x00" * HEADER_SIZE)
 
@@ -253,12 +296,12 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
         off_tokenizer = pad64(out)
         out.write(tok_blob)
 
-        # 2. Embeddings (tied with lm_head)
+        # 2. Embeddings (also the LM head when tie_word_embeddings=True)
         off_embed = pad64(out)
-        emb = read_tensor_f32(sf, hdr, data_offset, "model.embed_tokens.weight")
+        emb = tensor_store.read("model.embed_tokens.weight")
         assert emb.shape == (vocab_size, dim), f"Unexpected embed shape {emb.shape}"
-        if "lm_head.weight" in hdr and tie_emb:
-            lmh = read_tensor_f32(sf, hdr, data_offset, "lm_head.weight")
+        if "lm_head.weight" in tensor_store.weight_map and tie_emb:
+            lmh = tensor_store.read("lm_head.weight")
             max_diff = float(np.max(np.abs(emb - lmh)))
             assert max_diff == 0.0, f"tie_word_embeddings=True but diff={max_diff}"
             print("Verified embed_tokens == lm_head exact (max_diff=0.0)")
@@ -275,10 +318,10 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
             prefix = f"model.layers.{l}"
 
             # 4 FP32 norm vectors
-            in_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.input_layernorm.weight")
-            q_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.self_attn.q_norm.weight")
-            k_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.self_attn.k_norm.weight")
-            post_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.post_attention_layernorm.weight")
+            in_norm = tensor_store.read(f"{prefix}.input_layernorm.weight")
+            q_norm = tensor_store.read(f"{prefix}.self_attn.q_norm.weight")
+            k_norm = tensor_store.read(f"{prefix}.self_attn.k_norm.weight")
+            post_norm = tensor_store.read(f"{prefix}.post_attention_layernorm.weight")
 
             assert in_norm.shape == (dim,)
             assert q_norm.shape == (head_dim,)
@@ -302,7 +345,7 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
             ]
             for name, expected_shape in proj_specs:
                 pad64(out)
-                mat = read_tensor_f32(sf, hdr, data_offset, name)
+                mat = tensor_store.read(name)
                 assert mat.shape == expected_shape, f"{name}: got {mat.shape}, expected {expected_shape}"
                 out.write(quantize_matrix_q8_0_row_split(mat, scale_dtype=scale_dtype))
 
@@ -318,17 +361,39 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
 
         # 4. Final RMSNorm
         off_final_norm = pad64(out)
-        final_norm = read_tensor_f32(sf, hdr, data_offset, "model.norm.weight")
+        final_norm = tensor_store.read("model.norm.weight")
         assert final_norm.shape == (dim,)
         out.write(final_norm.astype("<f4").tobytes())
+
+        # 5. Untied LM head (e.g. Qwen3-8B: tie_word_embeddings=False)
+        #    Q8_0 [vocab_size, dim], same row-split format as embed_tokens.
+        #    Tied models keep off_lm_head = 0 (header byte-identical to before).
+        off_lm_head = 0
+        lmh_row = dim + (dim // 32) * (2 if use_fp16 else 4)
+        if not tie_emb:
+            if "lm_head.weight" not in tensor_store.weight_map:
+                raise KeyError("tie_word_embeddings=False but lm_head.weight is missing")
+            off_lm_head = pad64(out)
+            lmh = tensor_store.read("lm_head.weight")
+            assert lmh.shape == (vocab_size, dim), (
+                f"lm_head.weight shape {lmh.shape} != (vocab_size={vocab_size}, hidden_size={dim})"
+            )
+            print(f"Quantizing untied lm_head {lmh.shape} -> Q8_0 (scale_dtype={scale_dtype})...")
+            lmh_bytes = quantize_matrix_q8_0_row_split(lmh, scale_dtype=scale_dtype)
+            del lmh
+            assert len(lmh_bytes) == vocab_size * lmh_row, "lm_head Q8_0 size mismatch"
+            out.write(lmh_bytes)
+            del lmh_bytes
         file_size = pad64(out)
+        if off_lm_head:
+            assert off_lm_head % 64 == 0 and off_lm_head + vocab_size * lmh_row <= file_size
 
         # Write 128-byte header
         flags = (FLAG_TIED_EMB if tie_emb else 0) | FLAG_QK_NORM | (FLAG_FP16_SCALES if use_fp16 else 0)
         eos_1 = 151645  # <|im_end|>
         eos_2 = 151643  # <|endoftext|>
         header = struct.pack(
-            "<4sIIIIIIIIIffIIIIQQQQQQ16s",
+            "<4sIIIIIIIIIffIIIIQQQQQQQ8s",
             MAGIC,
             version,
             dim,
@@ -351,7 +416,8 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
             layer_stride,
             off_final_norm,
             file_size,
-            b"\x00" * 16,
+            off_lm_head,
+            b"\x00" * 8,
         )
         assert len(header) == HEADER_SIZE
         out.seek(0)
@@ -365,6 +431,7 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
     print(f"  off_embed    : {off_embed:,}")
     print(f"  off_layers   : {off_layers:,} (stride={layer_stride:,} x {n_layers})")
     print(f"  off_final_nrm: {off_final_norm:,}")
+    print(f"  off_lm_head  : {off_lm_head:,}" + ("" if off_lm_head else " (tied: logits use embed_tokens)"))
     print(f"  Elapsed      : {dt:.2f} s")
 
 

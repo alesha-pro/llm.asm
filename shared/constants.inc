@@ -68,6 +68,7 @@
 %define HDR_LAYER_STRIDE    88
 %define HDR_OFF_FINAL_NORM  96
 %define HDR_FILE_SIZE       104
+%define HDR_OFF_LM_HEAD     112         ; uint64: untied Q8_0 lm_head offset (0 = none / tied)
 
 ; --- Tokenizer Section Header Offsets (relative to base + off_tokenizer) ---
 %define TOKH_OFF_B2T        0
@@ -154,4 +155,5 @@
 %define CTX_BUF_PROBS       360
 %define CTX_FP16_SCALES     368         ; uint32: 0 = v1 fp32 scales, 1 = v2 fp16 scales
 %define CTX_SCALE_SHIFT     372         ; uint32: 3 = fp32 (K>>3), 4 = fp16 (K>>4)
+%define CTX_LMHEAD_PTR      376         ; Q8_0 [vocab, dim] logits weights (embed if tied)
 %define CTX_SIZE            384
